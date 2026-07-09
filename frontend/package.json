@@ -1,0 +1,32 @@
+{
+  "name": "helloagents-trip-planner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "test:api-timeout": "node scripts/check-api-timeout.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@amap/amap-jsapi-loader": "^1.0.1",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "@vueuse/core": "^10.11.0",
+    "ant-design-vue": "^4.2.3",
+    "axios": "^1.7.2",
+    "dayjs": "^1.11.11",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^2.5.1",
+    "lucide-vue-next": "^0.468.0",
+    "pinia": "^2.1.7",
+    "pinia-plugin-persistedstate": "^3.2.1",
+    "vue": "^3.4.29",
+    "vue-router": "^4.3.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vite": "^5.3.1",
+    "vue-tsc": "^2.0.21"
+  }
+}
