@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import uuid
 from datetime import date
 from decimal import Decimal
@@ -40,6 +42,9 @@ from app.services.baidu_map_service import BaiduMapService
 from app.services.plan_quality import PlanQualityError, validate_trip_plan_for_request
 from app.tools.bootstrap import bootstrap_tools
 from app.tools.executor import ToolExecutor
+
+
+logger = logging.getLogger(__name__)
 
 
 def _iso(value) -> str:
@@ -317,6 +322,7 @@ class StateService:
     async def send_conversation_message(self, session_id: str, request: ConversationRequest) -> ConversationResponse:
         session_uuid = _parse_uuid(session_id, "session_id")
         referenced_plan_uuid: uuid.UUID | None = None
+        referenced_plan: TripPlanModel | None = None
         referenced_plan_context = ""
 
         if request.referenced_plan_id:
@@ -375,6 +381,31 @@ class StateService:
         if not content:
             content = "I recorded your request, but no LLM response is available because the LLM is not configured."
 
+        updated_plan = None
+        if referenced_plan and self._detect_modification_intent(request.message):
+            try:
+                updated_plan = await self._modify_plan_via_conversation(
+                    llm=llm,
+                    tool_executor=executor,
+                    referenced_plan=referenced_plan,
+                    user_message=request.message,
+                    session_uuid=session_uuid,
+                    conversation_id=assistant_id,
+                )
+                if updated_plan:
+                    content = f"行程已更新（版本 {updated_plan.version}）\n\n{content}"
+            except Exception as exc:
+                logger.warning("Conversation plan modification failed: %s", exc, exc_info=True)
+                self._add_audit_event(
+                    event_type="trip_plan_conversation_update_failed",
+                    action="conversation_modify_plan",
+                    severity="warning",
+                    session_id=session_uuid,
+                    resource_type="trip_plan",
+                    resource_id=referenced_plan.id,
+                    details_json={"error": str(exc), "message": request.message[:200]},
+                )
+
         assistant = ConversationMessage(
             id=assistant_id,
             session_id=session_uuid,
@@ -389,8 +420,141 @@ class StateService:
             role="assistant",
             content=content,
             tool_calls=tool_calls,
-            updated_plan=None,
+            updated_plan=updated_plan,
         )
+
+    @staticmethod
+    def _detect_modification_intent(message: str) -> bool:
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+
+        patterns = [
+            r"(把|将|请把|帮我把).+(换成|替换成|改成|调整为|变成)",
+            r"(替换|更换|换掉|改掉|修改|调整|优化|重排|删除|删掉|去掉|移除|取消|增加|新增|添加|加入|安排|提前|延后|挪到).+(行程|计划|景点|餐厅|饭店|酒店|住宿|交通|第[一二三四五六七八九十0-9]+天|day\s*\d+)",
+            r"(行程|计划|景点|餐厅|饭店|酒店|住宿|交通|第[一二三四五六七八九十0-9]+天|day\s*\d+).+(替换|更换|换成|改成|修改|调整|删除|删掉|去掉|增加|新增|添加|安排|取消|提前|延后|挪到)",
+            r"\b(replace|change|modify|update|remove|delete|add|swap|reschedule)\b.+\b(itinerary|plan|day|attraction|hotel|restaurant|meal|route)\b",
+        ]
+        return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+    async def _modify_plan_via_conversation(
+        self,
+        *,
+        llm: LLMService,
+        tool_executor: ToolExecutor,
+        referenced_plan: TripPlanModel,
+        user_message: str,
+        session_uuid: uuid.UUID,
+        conversation_id: uuid.UUID,
+    ) -> TripPlanResponse | None:
+        if not referenced_plan.plan_json or not getattr(llm, "enabled", True):
+            return None
+
+        current_plan = TripPlan.model_validate(referenced_plan.plan_json)
+        system_prompt = (
+            "你是一个旅行行程 JSON 编辑器。你只根据用户本轮要求修改给定 TripPlan，"
+            "未被要求修改的城市、日期、天气、酒店、餐饮、预算和景点信息必须保持不变。"
+            "必须只输出一个合法 JSON 对象，不要输出 Markdown、解释或代码块。"
+            "输出必须匹配 TripPlan schema，且不要包含 plan_id、status、version。"
+            "如果用户本轮并没有要求修改行程，输出 {\"no_change\": true}。"
+        )
+        base_prompt = self._build_plan_modification_prompt(current_plan, user_message)
+        last_error = ""
+
+        for attempt in range(2):
+            prompt = base_prompt
+            if last_error:
+                prompt = (
+                    f"{base_prompt}\n\n上一次输出无法解析或校验失败：{last_error}\n"
+                    "请重新输出完整、合法的 TripPlan JSON。"
+                )
+            text, _, usage = await llm.chat_with_tools(
+                system_prompt,
+                prompt,
+                [],
+                tool_executor,
+                max_tool_rounds=1,
+            )
+            self._record_token_usage(usage, conversation_id, referenced_plan.id)
+            try:
+                modified_plan = self._load_conversation_modified_plan(text)
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+
+            if modified_plan is None:
+                return None
+
+            referenced_plan.version += 1
+            referenced_plan.status = "editing"
+            referenced_plan.city = modified_plan.city
+            referenced_plan.start_date = date.fromisoformat(modified_plan.start_date)
+            referenced_plan.end_date = date.fromisoformat(modified_plan.end_date)
+            referenced_plan.days_count = len(modified_plan.days)
+            referenced_plan.plan_json = modified_plan.model_dump()
+            referenced_plan.overall_suggestions = modified_plan.overall_suggestions
+            referenced_plan.budget_summary = modified_plan.budget.model_dump() if modified_plan.budget else None
+            self._db.add(
+                TripPlanVersion(
+                    id=uuid.uuid4(),
+                    trip_plan_id=referenced_plan.id,
+                    version=referenced_plan.version,
+                    plan_json=referenced_plan.plan_json,
+                    change_summary=user_message[:200],
+                    change_type="agent_regenerate",
+                )
+            )
+            self._add_audit_event(
+                event_type="trip_plan_conversation_updated",
+                action="conversation_modify_plan",
+                session_id=session_uuid,
+                resource_type="trip_plan",
+                resource_id=referenced_plan.id,
+                details_json={"version": referenced_plan.version, "change_summary": user_message[:200]},
+            )
+            await self._db.flush()
+            return self._plan_response(referenced_plan, modified_plan)
+
+        self._add_audit_event(
+            event_type="trip_plan_conversation_update_failed",
+            action="conversation_modify_plan",
+            severity="warning",
+            session_id=session_uuid,
+            resource_type="trip_plan",
+            resource_id=referenced_plan.id,
+            details_json={"error": last_error, "message": user_message[:200]},
+        )
+        return None
+
+    @staticmethod
+    def _build_plan_modification_prompt(current_plan: TripPlan, user_message: str) -> str:
+        plan_json = json.dumps(current_plan.model_dump(mode="json"), ensure_ascii=False, indent=2)
+        return (
+            "当前 TripPlan JSON：\n"
+            f"{plan_json}\n\n"
+            "用户修改需求：\n"
+            f"{user_message}\n\n"
+            "请输出修改后的完整 TripPlan JSON。"
+        )
+
+    @staticmethod
+    def _load_conversation_modified_plan(text: str) -> TripPlan | None:
+        payload = json.loads(StateService._strip_json_fence(text))
+        if isinstance(payload, dict) and payload.get("no_change") is True:
+            return None
+        return TripPlan.model_validate(payload)
+
+    @staticmethod
+    def _strip_json_fence(text: str) -> str:
+        cleaned = (text or "").strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+        return cleaned
 
     async def list_conversation(
         self,

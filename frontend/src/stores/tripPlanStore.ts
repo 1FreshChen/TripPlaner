@@ -85,6 +85,21 @@ export const useTripPlanStore = defineStore('tripPlan', () => {
     versions.value = result.versions
   }
 
+  function applyExternalUpdate(updatedPlan: TripPlanResponse) {
+    currentPlan.value = updatedPlan
+    planId.value = updatedPlan.plan_id
+    planStatus.value = updatedPlan.status
+    originalPlan.value = null
+    versions.value = [
+      {
+        version: updatedPlan.version,
+        change_summary: '对话调整',
+        created_at: new Date().toISOString()
+      },
+      ...versions.value.filter(item => item.version !== updatedPlan.version)
+    ]
+  }
+
   async function revertToVersion(version: number) {
     if (!planId.value) return
     const result = await revertPlanVersion(planId.value, version)
@@ -147,6 +162,7 @@ export const useTripPlanStore = defineStore('tripPlan', () => {
     saveEdit,
     cancelEdit,
     loadVersions,
+    applyExternalUpdate,
     revertToVersion,
     moveAttraction,
     deleteAttraction,

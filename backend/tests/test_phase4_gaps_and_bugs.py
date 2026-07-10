@@ -1,16 +1,73 @@
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
+from app.models.db_models import AuditEvent, TripPlanVersion
 from app.models.schemas import ConversationRequest, DayPlan, TripPlan, TripPlanRequest
 from app.services.mock_data import build_mock_attractions, build_mock_hotels, build_mock_weather
 from app.services import state_service
 from app.services.llm_service import TokenUsage as LLMTokenUsage
 from app.services.state_service import StateService
+
+
+def _conversation_trip_plan(overall_suggestions: str = "测试行程") -> TripPlan:
+    return TripPlan(
+        city="北京",
+        start_date="2026-07-01",
+        end_date="2026-07-03",
+        days=[],
+        weather_info=[],
+        overall_suggestions=overall_suggestions,
+        budget=None,
+    )
+
+
+def _fake_plan_model(trip_plan: TripPlan):
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        status="completed",
+        version=1,
+        city=trip_plan.city,
+        start_date=date.fromisoformat(trip_plan.start_date),
+        end_date=date.fromisoformat(trip_plan.end_date),
+        days_count=len(trip_plan.days),
+        plan_json=trip_plan.model_dump(),
+        overall_suggestions=trip_plan.overall_suggestions,
+        budget_summary=None,
+    )
+
+
+class FakeConversationDB:
+    def __init__(self):
+        self.added = []
+        self.flush_count = 0
+
+    def add(self, value):
+        self.added.append(value)
+
+    async def flush(self):
+        self.flush_count += 1
+
+
+class FakeModificationLLM:
+    enabled = True
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    async def chat_with_tools(self, system_prompt, user_prompt, tools, tool_executor, max_tool_rounds=5):
+        self.calls.append((system_prompt, user_prompt, tools, tool_executor, max_tool_rounds))
+        return (
+            self.responses.pop(0),
+            [],
+            LLMTokenUsage(model="gpt-test", provider="test", prompt_tokens=7, completion_tokens=5, total_tokens=12),
+        )
 
 
 def test_plan_response_raises_http_exception_when_plan_json_is_missing():
@@ -199,3 +256,92 @@ def test_send_conversation_message_calls_llm_tools_and_records_usage(monkeypatch
     assert FakeToolExecutor.calls == [("fake_weather", {"city": "Beijing"})]
     assert len(FakeLLMService.calls) == 1
     assert any(getattr(item, "total_tokens", 0) == 12 for item in fake_db.added)
+
+
+def test_detect_modification_intent_matches_adjustment_requests():
+    assert StateService._detect_modification_intent("把第二天的故宫换成天坛")
+    assert StateService._detect_modification_intent("第二天少去一个博物馆，多安排公园")
+    assert StateService._detect_modification_intent("replace day 2 attraction with Temple of Heaven")
+    assert not StateService._detect_modification_intent("天坛好玩吗")
+    assert not StateService._detect_modification_intent("介绍一下北京的历史")
+
+
+def test_modify_plan_via_conversation_writes_agent_version():
+    original = _conversation_trip_plan()
+    modified = _conversation_trip_plan("第二天已改为天坛。")
+    referenced_plan = _fake_plan_model(original)
+    fake_db = FakeConversationDB()
+    service = StateService(fake_db)
+    llm = FakeModificationLLM([modified.model_dump_json()])
+
+    result = asyncio.run(
+        service._modify_plan_via_conversation(
+            llm=llm,
+            tool_executor=SimpleNamespace(),
+            referenced_plan=referenced_plan,
+            user_message="把第二天的故宫换成天坛",
+            session_uuid=referenced_plan.session_id,
+            conversation_id=uuid.uuid4(),
+        )
+    )
+
+    versions = [item for item in fake_db.added if isinstance(item, TripPlanVersion)]
+    assert result is not None
+    assert result.version == 2
+    assert result.overall_suggestions == "第二天已改为天坛。"
+    assert referenced_plan.version == 2
+    assert referenced_plan.plan_json["overall_suggestions"] == "第二天已改为天坛。"
+    assert versions[0].change_type == "agent_regenerate"
+    assert versions[0].change_summary == "把第二天的故宫换成天坛"
+    assert any(isinstance(item, AuditEvent) and item.event_type == "trip_plan_conversation_updated" for item in fake_db.added)
+    assert llm.calls[0][2] == []
+    assert llm.calls[0][4] == 1
+
+
+def test_modify_plan_via_conversation_retries_invalid_json_once():
+    original = _conversation_trip_plan()
+    modified = _conversation_trip_plan("已按要求重排。")
+    referenced_plan = _fake_plan_model(original)
+    fake_db = FakeConversationDB()
+    service = StateService(fake_db)
+    llm = FakeModificationLLM(["not json", modified.model_dump_json()])
+
+    result = asyncio.run(
+        service._modify_plan_via_conversation(
+            llm=llm,
+            tool_executor=SimpleNamespace(),
+            referenced_plan=referenced_plan,
+            user_message="调整一下第一天行程",
+            session_uuid=referenced_plan.session_id,
+            conversation_id=uuid.uuid4(),
+        )
+    )
+
+    assert result is not None
+    assert result.version == 2
+    assert len(llm.calls) == 2
+    assert "上一次输出无法解析或校验失败" in llm.calls[1][1]
+
+
+def test_modify_plan_via_conversation_returns_none_when_retry_fails():
+    original = _conversation_trip_plan()
+    referenced_plan = _fake_plan_model(original)
+    fake_db = FakeConversationDB()
+    service = StateService(fake_db)
+    llm = FakeModificationLLM(["not json", "still not json"])
+
+    result = asyncio.run(
+        service._modify_plan_via_conversation(
+            llm=llm,
+            tool_executor=SimpleNamespace(),
+            referenced_plan=referenced_plan,
+            user_message="删除第二天行程",
+            session_uuid=referenced_plan.session_id,
+            conversation_id=uuid.uuid4(),
+        )
+    )
+
+    assert result is None
+    assert referenced_plan.version == 1
+    assert not [item for item in fake_db.added if isinstance(item, TripPlanVersion)]
+    assert any(isinstance(item, AuditEvent) and item.event_type == "trip_plan_conversation_update_failed" for item in fake_db.added)

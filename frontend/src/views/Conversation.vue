@@ -10,8 +10,11 @@
       <section class="panel conversation-panel">
         <div class="message-list">
           <div v-for="(item, index) in messages" :key="`${item.id}-${index}`" class="message-row">
-            <strong>{{ item.role === 'user' ? '我' : '助手' }}</strong>
-            <span>{{ item.content }}</span>
+            <div class="message-meta">
+              <strong>{{ item.role === 'user' ? '我' : '助手' }}</strong>
+              <a-tag v-if="item._planUpdated" color="success">行程已更新</a-tag>
+            </div>
+            <span class="message-content">{{ item.content }}</span>
           </div>
         </div>
         <a-input-search
@@ -44,7 +47,10 @@ const handleSend = async () => {
   if (!content) return
   draft.value = ''
   try {
-    await sessionStore.send(content, tripPlanStore.planId || undefined)
+    const reply = await sessionStore.send(content, tripPlanStore.planId || undefined)
+    if (reply.updated_plan) {
+      message.success('行程已更新')
+    }
   } catch (error) {
     message.error(error instanceof Error ? error.message : '发送失败')
   }

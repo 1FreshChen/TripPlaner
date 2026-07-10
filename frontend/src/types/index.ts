@@ -144,6 +144,7 @@ export interface ConversationMessage {
   content: string
   tool_calls?: Record<string, unknown>[] | null
   created_at: string
+  _planUpdated?: boolean
 }
 
 export interface ConversationReply {

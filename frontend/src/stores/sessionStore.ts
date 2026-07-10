@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { createSession, getConversation, getSession, sendMessage } from '../services/conversationApi'
 import type { ConversationMessage } from '../types'
+import { useTripPlanStore } from './tripPlanStore'
 
 export const useSessionStore = defineStore('session', () => {
   const sessionId = ref<string>(localStorage.getItem('session_id') || '')
@@ -41,12 +42,16 @@ export const useSessionStore = defineStore('session', () => {
     if (!sessionId.value) await initSession()
     messages.value.push({ id: '', role: 'user', content, created_at: new Date().toISOString() })
     const reply = await sendMessage(sessionId.value, { message: content, referenced_plan_id: planId })
+    if (reply.updated_plan) {
+      useTripPlanStore().applyExternalUpdate(reply.updated_plan)
+    }
     messages.value.push({
       id: reply.message_id,
       role: reply.role,
       content: reply.content,
       tool_calls: reply.tool_calls,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
+      _planUpdated: Boolean(reply.updated_plan)
     })
     return reply
   }
