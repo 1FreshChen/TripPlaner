@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
 
 from app.services.amap_service import AmapService
@@ -33,5 +34,5 @@ class AmapPOISearchTool(BaseTool):
 
     async def execute(self, keywords: str, city: str, offset: int = 10, **kwargs: Any) -> Dict[str, Any]:
         normalized_offset = max(1, min(offset, 25))
-        pois = self._amap.search_pois(keywords, city, normalized_offset)
+        pois = await asyncio.to_thread(self._amap.search_pois, keywords, city, normalized_offset)
         return {"pois": pois, "count": len(pois), "city": city, "success": True}

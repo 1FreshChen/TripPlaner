@@ -11,6 +11,23 @@ class Settings(BaseSettings):
     llm_base_url: str = Field(default="https://api.openai.com/v1", alias="LLM_BASE_URL")
     llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
     amap_api_key: str = Field(default="", alias="AMAP_API_KEY")
+    amap_mcp_enabled: bool = Field(default=True, alias="AMAP_MCP_ENABLED")
+    amap_mcp_command: str = Field(default="npx", alias="AMAP_MCP_COMMAND")
+    amap_mcp_args: list[str] = Field(
+        default_factory=lambda: ["-y", "@amap/amap-maps-mcp-server"],
+        alias="AMAP_MCP_ARGS",
+    )
+    amap_mcp_startup_timeout_seconds: float = Field(
+        default=90.0,
+        ge=1.0,
+        alias="AMAP_MCP_STARTUP_TIMEOUT_SECONDS",
+    )
+    amap_mcp_call_timeout_seconds: float = Field(
+        default=20.0,
+        ge=1.0,
+        alias="AMAP_MCP_CALL_TIMEOUT_SECONDS",
+    )
+    amap_mcp_http_fallback: bool = Field(default=True, alias="AMAP_MCP_HTTP_FALLBACK")
     baidu_map_api_key: str = Field(default="", alias="BAIDU_MAP_API_KEY")
     unsplash_access_key: str = Field(default="", alias="UNSPLASH_ACCESS_KEY")
     enable_external_services: bool = Field(default=True, alias="ENABLE_EXTERNAL_SERVICES")
@@ -25,6 +42,9 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
+    task_result_ttl_days: int = Field(default=30, ge=1, alias="TASK_RESULT_TTL_DAYS")
+    task_worker_timeout_seconds: int = Field(default=900, ge=30, alias="TASK_WORKER_TIMEOUT_SECONDS")
+    task_sse_timeout_seconds: int = Field(default=300, ge=30, alias="TASK_SSE_TIMEOUT_SECONDS")
     encryption_key: str = Field(default="", alias="ENCRYPTION_KEY")
     max_conversation_messages: int = Field(default=20, alias="MAX_CONVERSATION_MESSAGES")
     rate_limit_per_minute: int = Field(default=5, alias="RATE_LIMIT_PER_MINUTE")

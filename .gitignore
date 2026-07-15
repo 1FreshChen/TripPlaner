@@ -18,6 +18,7 @@ frontend/dist/
 *.err.log
 
 # Editor and OS
+.claude/
 .idea/
 .vscode/
 .DS_Store

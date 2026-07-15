@@ -146,3 +146,47 @@ def test_orchestrator_uses_fallback_chain_after_retries_are_exhausted():
     assert result.output == "deterministic result"
     assert result.fallback_used == FallbackLevel.DETERMINISTIC
     assert trace.any_fallback_used is True
+
+
+def test_orchestrator_clears_stale_quality_flag_after_fallback_success():
+    class QualityFailingPlanner:
+        name = "trip_planner"
+
+        async def execute(self, context):
+            context["trip_planner_quality_failed"] = True
+            context.setdefault("plan_critique_events", []).append(
+                {
+                    "details": {
+                        "needs_revision": True,
+                        "revision_summary": "failed candidate",
+                    }
+                }
+            )
+            raise ValueError("generated plan did not pass quality review")
+
+    async def deterministic_fallback(context):
+        return "deterministic plan"
+
+    registry = AgentRegistry()
+    registry.register(
+        AgentDefinition(
+            name="trip_planner",
+            agent_class=QualityFailingPlanner,
+            retry_policy=RetryPolicy(max_attempts=1, base_delay=0),
+        )
+    )
+    fallback_chain = FallbackChain()
+    fallback_chain.register_handler("trip_planner", FallbackLevel.DETERMINISTIC, deterministic_fallback)
+
+    context = {}
+    orchestrator = AgentOrchestrator(registry, fallback_chain, ExecutionTracer())
+    trace = asyncio.run(orchestrator.run("fallback-quality-flag-test", context))
+
+    result = trace.agent_results[0]
+    assert result.status == AgentStatus.COMPLETED
+    assert result.output == "deterministic plan"
+    assert result.fallback_used == FallbackLevel.DETERMINISTIC
+    assert context["trip_planner"] == "deterministic plan"
+    assert "trip_planner_quality_failed" not in context
+    assert "plan_critique_events" not in context
+    assert context["failed_plan_critique_events"][0]["details"]["needs_revision"] is True

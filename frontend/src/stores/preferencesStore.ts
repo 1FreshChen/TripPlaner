@@ -11,19 +11,19 @@ export const usePreferencesStore = defineStore('preferences', () => {
   const savedItems = ref<SavedItem[]>([])
   const loaded = ref(false)
 
-  async function load(userId: string) {
+  async function load(sessionId: string) {
     if (loaded.value) return
-    const prefs = await getPreferences(userId)
+    const prefs = await getPreferences(sessionId)
     preferredCategories.value = prefs.preferred_categories
     budgetProfile.value = prefs.budget_profile
     travelStyle.value = prefs.travel_style
     favoriteCities.value = prefs.favorite_cities
-    savedItems.value = await getSavedItems(userId)
+    savedItems.value = await getSavedItems(sessionId)
     loaded.value = true
   }
 
-  async function save(userId: string) {
-    await updatePreferences(userId, {
+  async function save(sessionId: string) {
+    await updatePreferences(sessionId, {
       preferred_categories: preferredCategories.value,
       budget_profile: budgetProfile.value,
       travel_style: travelStyle.value,
@@ -31,13 +31,13 @@ export const usePreferencesStore = defineStore('preferences', () => {
     })
   }
 
-  async function addSavedItem(userId: string, item: Omit<SavedItem, 'id' | 'created_at'>) {
-    const result = await saveItem(userId, item)
+  async function addSavedItem(sessionId: string, item: Omit<SavedItem, 'id' | 'created_at'>) {
+    const result = await saveItem(sessionId, item)
     savedItems.value.unshift(result)
   }
 
-  async function removeSavedItem(userId: string, itemId: string) {
-    await unsaveItem(userId, itemId)
+  async function removeSavedItem(sessionId: string, itemId: string) {
+    await unsaveItem(sessionId, itemId)
     savedItems.value = savedItems.value.filter(item => item.id !== itemId)
   }
 

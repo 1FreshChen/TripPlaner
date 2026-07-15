@@ -82,6 +82,24 @@ def test_bootstrap_registers_all_phase3_tools():
     assert len(registry.get_openai_functions()) == 7
 
 
+def test_bootstrap_returns_registry_bound_to_each_callers_services():
+    first_amap = FakeAmapService()
+    first_unsplash = FakeUnsplashService()
+    first_baidu = FakeBaiduService()
+    second_amap = FakeAmapService()
+    second_unsplash = FakeUnsplashService()
+    second_baidu = FakeBaiduService()
+
+    first = bootstrap_tools(first_amap, first_unsplash, first_baidu, reset=True)
+    second = bootstrap_tools(second_amap, second_unsplash, second_baidu)
+
+    assert first is not second
+    assert first.get("amap_poi_search")._amap is first_amap
+    assert second.get("amap_poi_search")._amap is second_amap
+    assert first.get("baidu_poi_search")._baidu is first_baidu
+    assert second.get("baidu_poi_search")._baidu is second_baidu
+
+
 def test_baidu_poi_search_tool_normalizes_limit_and_returns_restaurants():
     service = FakeBaiduService()
     tool = BaiduPOISearchTool(service)

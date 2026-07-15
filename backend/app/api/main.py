@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -17,14 +20,27 @@ except ImportError:
 from app.api.middlewares.request_id import RequestIDMiddleware
 from app.api.routes.conversation import router as conversation_router
 from app.api.routes.preferences import router as preferences_router
+from app.api.routes.saved_items import router as saved_items_router
 from app.api.routes.sessions import router as sessions_router
 from app.api.routes.trip import router as trip_router
 from app.config import get_settings
+from app.services.amap_mcp_service import close_amap_mcp_service
+from app.tasks.queue import close_task_queue
 
 
 settings = get_settings()
 
-app = FastAPI(title="智能旅行助手 API", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    try:
+        yield
+    finally:
+        await close_task_queue(getattr(application.state, "task_queue", None))
+        await asyncio.to_thread(close_amap_mcp_service)
+
+
+app = FastAPI(title="智能旅行助手 API", version="0.3.0", lifespan=lifespan)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
@@ -53,3 +69,4 @@ app.include_router(trip_router, prefix="/api")
 app.include_router(sessions_router, prefix="/api")
 app.include_router(conversation_router, prefix="/api")
 app.include_router(preferences_router, prefix="/api")
+app.include_router(saved_items_router, prefix="/api")

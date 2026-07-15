@@ -90,10 +90,20 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { message, Modal } from 'ant-design-vue'
+import {
+  Alert as AAlert,
+  Button as AButton,
+  Empty as AEmpty,
+  message,
+  Modal,
+  Space as ASpace,
+  Spin as ASpin,
+  Tag as ATag,
+  Tooltip as ATooltip
+} from 'ant-design-vue'
 import { Archive, ArrowLeft, Edit3, Eye, History as HistoryIcon, MapPinned, MessageCircle, RefreshCw } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
-import { archiveTripPlan, getTripPlan } from '../services/api'
+import { archiveTripPlan } from '../services/api'
 import { getSession } from '../services/conversationApi'
 import { useSessionStore } from '../stores/sessionStore'
 import { useTripPlanStore } from '../stores/tripPlanStore'
@@ -127,18 +137,22 @@ const refresh = async () => {
   }
 }
 
-const openPlan = async (planId: string, edit = false) => {
+const openPlan = async (
+  planId: string,
+  edit = false,
+  destination: 'result' | 'conversation' = 'result'
+) => {
   loading.value = true
   try {
-    const plan = await getTripPlan(planId)
-    tripPlanStore.currentPlan = plan
-    tripPlanStore.planId = plan.plan_id
-    tripPlanStore.planStatus = plan.status
-    tripPlanStore.originalPlan = null
+    await tripPlanStore.loadPlan(planId)
     if (edit) {
       tripPlanStore.startEdit()
     }
-    router.push({ name: 'result' })
+    if (destination === 'result') {
+      await router.push({ name: 'result', params: { planId } })
+    } else {
+      await router.push({ name: 'conversation', query: { planId } })
+    }
   } catch (err) {
     message.error(err instanceof Error ? err.message : '打开计划失败')
   } finally {
@@ -147,8 +161,7 @@ const openPlan = async (planId: string, edit = false) => {
 }
 
 const continueConversation = async (planId: string) => {
-  await openPlan(planId)
-  router.push({ name: 'conversation' })
+  await openPlan(planId, false, 'conversation')
 }
 
 const confirmArchive = (planId: string, city: string) => {
@@ -161,10 +174,7 @@ const confirmArchive = (planId: string, city: string) => {
     async onOk() {
       await archiveTripPlan(planId)
       if (tripPlanStore.planId === planId) {
-        tripPlanStore.currentPlan = null
-        tripPlanStore.planId = null
-        tripPlanStore.planStatus = 'idle'
-        tripPlanStore.originalPlan = null
+        tripPlanStore.clearPlan()
       }
       message.success('计划已归档')
       await refresh()

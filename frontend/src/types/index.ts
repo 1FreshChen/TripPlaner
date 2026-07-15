@@ -99,6 +99,49 @@ export interface TripPlanRequest {
   accommodation: string
 }
 
+export type TaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'expired'
+export type TaskPhase =
+  | 'queued'
+  | 'preparing'
+  | 'collecting_context'
+  | 'llm_planning'
+  | 'validating'
+  | 'meal_enrichment'
+  | 'saving'
+  | 'completed'
+  | 'failed'
+
+export interface TripPlanTaskCreatedResponse {
+  task_id: string
+  status: TaskStatus
+  status_url: string
+  events_url: string
+  result_url: string
+}
+
+export interface TripPlanTaskStatusResponse {
+  task_id: string
+  status: TaskStatus
+  phase: TaskPhase
+  progress: number
+  message: string
+  queued_at: string
+  started_at?: string
+  finished_at?: string
+  updated_at: string
+  elapsed_ms: number
+  phase_elapsed_ms: number
+  phase_timings: Record<string, number>
+  result_url?: string
+  error_code?: string
+  error_message?: string
+}
+
+export interface TripPlanTaskPendingResult {
+  status: TaskStatus
+  message: string
+}
+
 export interface TripPlanUpdateRequest {
   plan_json: TripPlan
   change_summary: string
@@ -144,7 +187,10 @@ export interface ConversationMessage {
   content: string
   tool_calls?: Record<string, unknown>[] | null
   created_at: string
+  plan_updated?: boolean
+  plan_update_failed?: boolean
   _planUpdated?: boolean
+  _planUpdateFailed?: boolean
 }
 
 export interface ConversationReply {
@@ -153,6 +199,12 @@ export interface ConversationReply {
   content: string
   tool_calls: Record<string, unknown>[]
   updated_plan?: TripPlanResponse | null
+  plan_update_failed?: boolean
+}
+
+export interface ConversationListResponse {
+  messages: ConversationMessage[]
+  has_more: boolean
 }
 
 export interface UserPreferences {

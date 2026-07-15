@@ -9,8 +9,8 @@ export function useTripPlanner(router: Router) {
 
   async function submit(request: TripPlanRequest) {
     const session = await sessionStore.initSession()
-    await tripPlanStore.createPlan({ ...request, session_id: session.session_id })
-    await router.push({ name: 'result' })
+    const task = await tripPlanStore.createPlan({ ...request, session_id: session.session_id })
+    await router.push({ name: 'task', params: { taskId: task.task_id } })
   }
 
   return { submit, sessionStore, tripPlanStore }
