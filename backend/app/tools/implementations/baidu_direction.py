@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
 
 from app.services.baidu_map_service import BaiduMapService
@@ -37,5 +38,11 @@ class BaiduDirectionTool(BaseTool):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         normalized_mode = mode if mode in self._valid_modes else "transit"
-        routes = self._baidu.get_direction(origin, destination, city, mode=normalized_mode)
+        routes = await asyncio.to_thread(
+            self._baidu.get_direction,
+            origin,
+            destination,
+            city,
+            mode=normalized_mode,
+        )
         return {"routes": routes, "count": len(routes), "city": city, "success": True}

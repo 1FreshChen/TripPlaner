@@ -43,6 +43,54 @@ class User(Base):
     saved_items: Mapped[list["SavedItem"]] = relationship(back_populates="user")
 
 
+class TripPlanTask(Base):
+    __tablename__ = "trip_plan_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','cancelled','expired')",
+            name="ck_trip_plan_tasks_status",
+        ),
+        CheckConstraint("progress >= 0 AND progress <= 100", name="ck_trip_plan_tasks_progress"),
+        Index("idx_trip_plan_tasks_user_id", "user_id"),
+        Index("idx_trip_plan_tasks_status", "status"),
+        Index("idx_trip_plan_tasks_updated", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    request_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", server_default=text("'queued'"))
+    phase: Mapped[str] = mapped_column(String(64), nullable=False, default="queued", server_default=text("'queued'"))
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    message: Mapped[str] = mapped_column(Text, nullable=False, default="任务已进入队列", server_default=text("'任务已进入队列'"))
+    phase_timings: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    result_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("trip_plans.id", ondelete="SET NULL"),
+    )
+    result_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    phase_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class TripPlan(Base):
     __tablename__ = "trip_plans"
     __table_args__ = (

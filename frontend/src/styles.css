@@ -346,6 +346,39 @@ select {
   text-align: center;
 }
 
+.conversation-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.message-list {
+  display: grid;
+  gap: 12px;
+  max-height: 62vh;
+  overflow: auto;
+}
+
+.message-row {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.message-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.message-content {
+  white-space: pre-wrap;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
 @media (max-width: 920px) {
   .planner-grid,
   .result-layout {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
 
 from app.services.baidu_map_service import BaiduMapService
@@ -51,7 +52,8 @@ class BaiduPOISearchTool(BaseTool):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         normalized_limit = max(1, min(limit, 20))
-        pois = self._baidu.search_pois(
+        pois = await asyncio.to_thread(
+            self._baidu.search_pois,
             keywords,
             city,
             tag=tag or None,

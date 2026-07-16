@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
 
 from app.services.amap_service import AmapService
@@ -19,5 +20,6 @@ class AmapWeatherTool(BaseTool):
         self._amap = amap_service
 
     async def execute(self, city: str, **kwargs: Any) -> Dict[str, Any]:
-        forecasts = [item.model_dump() for item in self._amap.get_weather(city)]
+        weather = await asyncio.to_thread(self._amap.get_weather, city)
+        forecasts = [item.model_dump() for item in weather]
         return {"weather": forecasts, "count": len(forecasts), "city": city, "success": True}

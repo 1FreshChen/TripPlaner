@@ -7,6 +7,7 @@ from app.orchestration.base import AgentDefinition, FallbackLevel, RetryPolicy
 from app.orchestration.fallback import FallbackChain
 from app.orchestration.registry import AgentRegistry
 from app.services.amap_service import AmapService
+from app.services.amap_mcp_service import get_amap_mcp_service
 from app.services.baidu_map_service import BaiduMapService
 from app.services.llm_service import LLMService
 from app.services.mock_data import build_mock_attractions, build_mock_hotels, build_mock_weather
@@ -37,7 +38,7 @@ def bootstrap_orchestration(
         settings.max_refinement_rounds if max_refinement_rounds is None else max_refinement_rounds
     )
     pass_score = settings.min_pass_score if min_pass_score is None else min_pass_score
-    amap = amap_service or AmapService(settings.amap_api_key)
+    amap = amap_service or get_amap_mcp_service()
     llm = llm_service or LLMService(settings.llm_api_key, settings.llm_base_url, settings.llm_model)
     tools = tool_registry or bootstrap_tools(amap_service=amap, baidu_service=baidu_service)
     executor = tool_executor or ToolExecutor(registry=tools)

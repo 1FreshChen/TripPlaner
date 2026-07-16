@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,7 @@ from app.orchestration.base import AgentStatus, BaseAgent, ExecutionTrace
 from app.orchestration.orchestrator import AgentOrchestrator
 from app.orchestration.trace import ExecutionTracer
 from app.services.amap_service import AmapService
+from app.services.amap_mcp_service import get_amap_mcp_service
 from app.services.budget import calculate_budget
 from app.services.llm_service import LLMService
 from app.services.mock_data import build_mock_attractions, build_mock_hotels, build_mock_meals, build_mock_weather
@@ -21,6 +23,9 @@ from app.services.unsplash_service import UnsplashService
 from app.tools.bootstrap import bootstrap_tools
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_planner_query(
@@ -160,9 +165,8 @@ class AttractionSearchAgent(BaseAgent):
 
     def __init__(self, amap_service: Optional[AmapService] = None, enable_external_services: Optional[bool] = None):
         settings = get_settings()
-        self.amap_service = amap_service
-        if self.amap_service is None:
-            self.amap_service = AmapService(settings.amap_api_key)
+        self.amap_service = amap_service or get_amap_mcp_service()
+        self.mcp_tool = getattr(self.amap_service, "mcp_tool", None)
         self.enable_external_services = (
             settings.enable_external_services if enable_external_services is None else enable_external_services
         )
@@ -201,9 +205,8 @@ class WeatherQueryAgent(BaseAgent):
 
     def __init__(self, amap_service: Optional[AmapService] = None, enable_external_services: Optional[bool] = None):
         settings = get_settings()
-        self.amap_service = amap_service
-        if self.amap_service is None:
-            self.amap_service = AmapService(settings.amap_api_key)
+        self.amap_service = amap_service or get_amap_mcp_service()
+        self.mcp_tool = getattr(self.amap_service, "mcp_tool", None)
         self.enable_external_services = (
             settings.enable_external_services if enable_external_services is None else enable_external_services
         )
@@ -212,11 +215,28 @@ class WeatherQueryAgent(BaseAgent):
         if self.enable_external_services:
             weather = self.amap_service.get_weather(request.city)
             if weather:
-                return weather[: request.days]
+                matching_weather = self._select_weather_for_request(weather, request)
+                if matching_weather:
+                    return matching_weather
         return build_mock_weather(request.start_date, request.days)
 
     async def execute(self, context: Dict[str, Any]) -> List[WeatherInfo]:
         return await asyncio.to_thread(self.run, context["request"])
+
+    @staticmethod
+    def _select_weather_for_request(
+        weather: List[WeatherInfo],
+        request: TripPlanRequest,
+    ) -> List[WeatherInfo]:
+        start = date.fromisoformat(request.start_date)
+        expected_dates = [
+            (start + timedelta(days=offset)).isoformat()
+            for offset in range(request.days)
+        ]
+        weather_by_date = {item.date: item for item in weather}
+        if all(day in weather_by_date for day in expected_dates):
+            return [weather_by_date[day] for day in expected_dates]
+        return []
 
 
 class HotelAgent(BaseAgent):
@@ -226,9 +246,8 @@ class HotelAgent(BaseAgent):
 
     def __init__(self, amap_service: Optional[AmapService] = None, enable_external_services: Optional[bool] = None):
         settings = get_settings()
-        self.amap_service = amap_service
-        if self.amap_service is None:
-            self.amap_service = AmapService(settings.amap_api_key)
+        self.amap_service = amap_service or get_amap_mcp_service()
+        self.mcp_tool = getattr(self.amap_service, "mcp_tool", None)
         self.enable_external_services = (
             settings.enable_external_services if enable_external_services is None else enable_external_services
         )
@@ -283,8 +302,11 @@ class PlannerAgent(BaseAgent):
             if payload:
                 try:
                     return TripPlan.model_validate(payload)
-                except ValidationError:
-                    pass
+                except ValidationError as exc:
+                    logger.warning(
+                        "Planner LLM response failed schema validation; using deterministic fallback (%d errors)",
+                        exc.error_count(),
+                    )
         return self._generate_deterministic_plan(request, attractions, weather_info, hotels)
 
     async def execute(self, context: Dict[str, Any]) -> TripPlan:
@@ -407,7 +429,8 @@ class TripPlannerAgent:
     ):
         settings = get_settings()
         use_external = settings.enable_external_services if enable_external_services is None else enable_external_services
-        self.amap_service = amap_service or AmapService(settings.amap_api_key)
+        self.amap_service = amap_service or get_amap_mcp_service()
+        self.mcp_tool = getattr(self.amap_service, "mcp_tool", None)
         self.llm_service = llm_service or LLMService(settings.llm_api_key, settings.llm_base_url, settings.llm_model)
         self.unsplash_service = unsplash_service or UnsplashService(settings.unsplash_access_key)
         self.tool_registry = tool_registry or bootstrap_tools(self.amap_service, self.unsplash_service)
@@ -460,7 +483,7 @@ class TripPlannerAgent:
         self.last_critique_events = context.get("plan_critique_events", [])
 
         if context.get("trip_planner_quality_failed"):
-            raise RuntimeError("Trip planning orchestration failed: generated plan did not pass quality review")
+            raise PlanQualityError("generated plan did not pass quality review")
         if trace.overall_status != AgentStatus.COMPLETED or "trip_planner" not in context:
             failure = next(
                 (result for result in trace.agent_results if result.status == AgentStatus.FAILED),
@@ -477,7 +500,7 @@ class TripPlannerAgent:
                 critique_events=self.last_critique_events,
             )
         except PlanQualityError as exc:
-            raise RuntimeError(f"Trip planning orchestration failed quality validation: {exc}") from exc
+            raise PlanQualityError(f"Trip planning orchestration failed quality validation: {exc}") from exc
         return trip_plan
 
     def plan_trip(self, request: TripPlanRequest) -> TripPlan:

@@ -213,6 +213,51 @@ class TripPlanResponse(TripPlan):
     version: int = Field(..., ge=1, description="当前版本号")
 
 
+TaskStatus = Literal["queued", "running", "succeeded", "failed", "cancelled", "expired"]
+TaskPhase = Literal[
+    "queued",
+    "preparing",
+    "collecting_context",
+    "llm_planning",
+    "validating",
+    "meal_enrichment",
+    "saving",
+    "completed",
+    "failed",
+]
+
+
+class TripPlanTaskCreatedResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    status_url: str
+    events_url: str
+    result_url: str
+
+
+class TripPlanTaskStatusResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    phase: TaskPhase
+    progress: int = Field(..., ge=0, le=100)
+    message: str
+    queued_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    updated_at: str
+    elapsed_ms: int = Field(default=0, ge=0)
+    phase_elapsed_ms: int = Field(default=0, ge=0)
+    phase_timings: dict[str, int] = Field(default_factory=dict)
+    result_url: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class TripPlanTaskPendingResult(BaseModel):
+    status: TaskStatus
+    message: str
+
+
 class TripPlanUpdateRequest(BaseModel):
     """旅行计划编辑请求"""
 
@@ -265,6 +310,7 @@ class SessionDetailResponse(BaseModel):
 class ConversationRequest(BaseModel):
     message: str = Field(..., min_length=1)
     referenced_plan_id: Optional[str] = None
+    apply_to_plan: bool = False
 
     @field_validator("message", mode="before")
     @classmethod
@@ -278,6 +324,8 @@ class ConversationMessageResponse(BaseModel):
     content: str
     tool_calls: Optional[List[dict[str, Any]]] = None
     created_at: str
+    plan_updated: bool = False
+    plan_update_failed: bool = False
 
 
 class ConversationResponse(BaseModel):
@@ -286,6 +334,7 @@ class ConversationResponse(BaseModel):
     content: str
     tool_calls: List[dict[str, Any]] = Field(default_factory=list)
     updated_plan: Optional[TripPlanResponse] = None
+    plan_update_failed: bool = False
 
 
 class ConversationListResponse(BaseModel):
@@ -305,3 +354,15 @@ class UserPreferenceUpdateRequest(BaseModel):
     budget_profile: dict[str, Any] = Field(default_factory=dict)
     travel_style: str = ""
     favorite_cities: List[str] = Field(default_factory=list)
+
+
+class SavedItemCreateRequest(BaseModel):
+    item_type: Literal["attraction", "hotel", "restaurant", "trip_plan"]
+    item_data: dict[str, Any]
+    tags: List[str] = Field(default_factory=list)
+    note: Optional[str] = None
+
+
+class SavedItemResponse(SavedItemCreateRequest):
+    id: str
+    created_at: str

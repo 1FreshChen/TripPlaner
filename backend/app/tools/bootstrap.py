@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.config import get_settings
 from app.services.amap_service import AmapService
+from app.services.amap_mcp_service import get_amap_mcp_service
 from app.services.baidu_map_service import BaiduMapService
 from app.services.unsplash_service import UnsplashService
 from app.tools.implementations import (
@@ -23,7 +24,7 @@ def bootstrap_tools(
     reset: bool = False,
 ) -> ToolRegistry:
     settings = get_settings()
-    amap = amap_service or AmapService(settings.amap_api_key)
+    amap = amap_service or get_amap_mcp_service()
     unsplash = unsplash_service or UnsplashService(settings.unsplash_access_key)
     baidu = baidu_service or BaiduMapService(settings.baidu_map_api_key)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
 
 from app.services.unsplash_service import UnsplashService
@@ -29,5 +30,9 @@ class UnsplashImageTool(BaseTool):
 
     async def execute(self, query: str, count: int = 1, **kwargs: Any) -> Dict[str, Any]:
         normalized_count = max(1, min(count, 5))
-        images = self._unsplash.search_photos(query, per_page=normalized_count)
+        images = await asyncio.to_thread(
+            self._unsplash.search_photos,
+            query,
+            per_page=normalized_count,
+        )
         return {"images": images, "count": len(images), "query": query, "success": True}

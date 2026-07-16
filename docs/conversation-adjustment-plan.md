@@ -8,16 +8,20 @@
 
 ---
 
-## 总体架构：两阶段 LLM 调用
+## 总体架构：混合意图识别 + 两阶段 LLM 调用
 
 ```
-用户消息 → [Phase 1] LLM 自由对话（支持工具调用） → 文字回复
-         → [意图检测] 是否在要求修改行程？
-              ├─ 否 → 返回纯文字（现有行为，零开销）
-              └─ 是 → [Phase 2] LLM 结构化输出（无工具） → 解析验证 → 写入DB → 返回 updated_plan
+用户消息 → [规则三态判断]
+              ├─ 明确修改 → 生成可执行修改指令
+              ├─ 明确咨询 → 不修改
+              └─ 无法确定 → LLM 结合最近对话判断并还原完整修改指令
+         → [Phase 1] LLM 自由对话（支持工具调用） → 文字回复
+         → 修改意图为真？
+              ├─ 否 → 返回纯文字
+              └─ 是 → [Phase 2] LLM 修改完整 TripPlan JSON → 校验 → 写入DB → 返回 updated_plan
 ```
 
-两阶段分离的原因：Phase 1 需要工具调用（如"查一下天坛门票"），Phase 2 需要结构化 JSON 输出（与 tool calling 互斥）。
+规则只快速处理明确表达；自然偏好、指代和“可以/就按刚才说的办”等确认语由 LLM 结合最近六条消息处理。Phase 1 与 Phase 2 分离，是因为前者需要工具调用，后者需要稳定的结构化 JSON。
 
 ---
 
@@ -25,10 +29,11 @@
 
 ### 1. 意图检测 — `state_service.py` 新增方法
 
-在 `StateService` 类中添加 `_detect_modification_intent(message: str) -> bool`：
-- 使用正则关键词列表匹配（替换/修改/增加/删除 + 天数/行程 等中文模式）
-- 纯规则匹配，零延迟，不额外消耗 LLM 调用
-- 仅当 `referenced_plan_id` 存在 **且** 意图检测命中时，才进入 Phase 2
+在 `StateService` 中实现三层判断：
+- `_classify_modification_intent_by_rules()` 返回 `True / False / None`，快速识别明确修改和明确咨询
+- `_resolve_modification_intent()` 只在规则返回 `None` 且前端启用 `apply_to_plan` 时调用 LLM
+- LLM 输出 `should_modify / instruction / reason`，其中 `instruction` 必须是脱离上下文也能执行的完整指令
+- `apply_to_plan` 表示允许智能修改关联行程，不再表示每一条消息都必须修改
 
 ### 2. 计划修改方法 — `state_service.py` 新增 `_modify_plan_via_conversation()`
 
@@ -39,42 +44,47 @@ b. 构建 Modification System Prompt（约束：只改用户要求的部分，�
 c. 调用 llm.chat_with_tools(tools=[], max_tool_rounds=1)
    → 不传 response_format（DeepSeek 兼容），靠 prompt 要求纯 JSON 输出
 d. 解析：_strip_json_fence() → json.loads() → TripPlan.model_validate()
-e. 失败则 retry 一次（带错误信息反馈给 LLM）
+e. 无效 JSON、`no_change` 或与原计划完全相同都会 retry 一次
 f. 成功后：复用 update_trip_plan 模式写入 DB
    - version += 1
    - change_type = "agent_regenerate"
-   - change_summary = 用户消息（截断200字）
+   - change_summary = 解析后的可执行修改指令（截断200字）
    - 记录 AuditEvent + TokenUsage
-g. 返回 TripPlanResponse 或 None（优雅降级）
+g. 成功返回 TripPlanResponse；确认需要修改但两次失败时抛出 PlanModificationError
 ```
 
 ### 3. 修改 `send_conversation_message()` — 串联 Phase 1 和 Phase 2
 
-在现有 Phase 1 完成后（获取 `content, tool_calls, usage` 之后），插入：
+在加载最近对话后先完成意图判断，再执行自由对话和计划修改：
 
 ```python
+intent = await _resolve_modification_intent(...)
 updated_plan = None
-if referenced_plan_id and _detect_modification_intent(message):
+if referenced_plan_id and intent.should_modify:
     try:
-        updated_plan = await self._modify_plan_via_conversation(...)
+        updated_plan = await self._modify_plan_via_conversation(
+            modification_instruction=intent.instruction,
+            ...,
+        )
         if updated_plan:
             content = f"✅ 行程已更新(版本{updated_plan.version})\n\n{content}"
     except Exception:
-        logger.warning(...)  # 优雅降级，不影响聊天
+        plan_update_failed = True
+        content += "本次没有成功保存修改，当前行程未变化"
 
-return ConversationResponse(..., updated_plan=updated_plan)  # 不再是 None
+return ConversationResponse(..., updated_plan=updated_plan, plan_update_failed=plan_update_failed)
 ```
 
-### 4. 提取 `_strip_json_fence` 到 `StateService`
+### 4. 复用 JSON 清理工具
 
-将 `LLMPlannerAgent._strip_json_fence()` 的纯函数逻辑复制为 `StateService` 的静态方法（10行，无依赖）。
+统一复用 `app.utils.json_utils.strip_json_fence()`，避免在 Planner 和 StateService 中保留重复实现。
 
 ### 涉及文件
 
 | 文件 | 改动 |
 |------|------|
-| `backend/app/services/state_service.py` | 主要改动：意图检测 + 修改方法 + 串联 + JSON fence 工具 |
-| （无其他后端文件需要改动） | Schema `ConversationResponse.updated_plan` 已存在，无需变更 |
+| `backend/app/services/state_service.py` | 三态规则、LLM 意图兜底、上下文指令还原、修改执行和审计 |
+| `backend/app/models/schemas.py` | 请求增加 `apply_to_plan`，响应增加明确的失败标志 |
 
 ---
 
@@ -127,8 +137,10 @@ if (reply.updated_plan) {
 
 | 场景 | 处理 |
 |------|------|
-| LLM Phase 2 返回无效 JSON（两次都失败） | 记录警告日志 + AuditEvent，`updated_plan=None`，对话正常继续 |
-| 意图检测误判（用户说"换"但不是改行程） | Phase 2 prompt 会要求 LLM 识别无修改需求 → 可扩展返回 `{"no_change": true}` |
+| 意图分类无法解析 | 保守地不修改，记录 `llm_error` 来源、日志和审计详情 |
+| LLM Phase 2 返回无效 JSON（两次都失败） | 记录警告和 AuditEvent，返回 `plan_update_failed=true` 并明确告知未保存 |
+| 已确认修改却返回 `no_change` 或相同 JSON | 作为失败自动重试，不能静默伪装成成功 |
+| 用户在已更新后再次说“可以” | 分类器根据“行程已更新”上下文判断，不重复生成版本 |
 | 连续快速发两条修改消息 | 第二条基于第一条的结果（DB 已 flush），版本号正确递增 |
 | 引用的行程已删除/归档 | `referenced_plan` 为 None，不进入 Phase 2 |
 | DeepSeek 不支持 `response_format` | Phase 2 不使用该参数，仅靠 prompt 要求纯 JSON + `_strip_json_fence` 清理 |
@@ -138,10 +150,11 @@ if (reply.updated_plan) {
 ## 验证方案
 
 1. **单元测试**（`backend/tests/` 新增）：
-   - `test_detect_modification_intent`：验证中英文关键词命中/不命中
+   - `test_detect_modification_intent`：验证明确修改、明确咨询和不确定三态结果
+   - `test_resolve_modification_intent`：验证上下文确认语由 LLM 还原为完整指令
    - `test_modify_success`：Mock LLM 返回有效 JSON，验证版本递增、change_type、audit 事件
-   - `test_modify_retry`：Mock 先无效后有效 JSON，验证 retry 成功
-   - `test_modify_both_fail`：Mock 两次无效 JSON，验证返回 None 且不写入 DB
+   - `test_modify_retry`：验证无效 JSON、`no_change` 和相同 JSON 都会重试
+   - `test_modify_both_fail`：Mock 两次无效 JSON，验证失败标志且不写入 DB
 
 2. **端到端测试**：
    - 生成一个行程 → 进入对话 → 输入"把第二天的故宫换成天坛"

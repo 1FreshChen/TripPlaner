@@ -19,6 +19,7 @@ from app.services.llm_service import LLMService, TokenUsage
 from app.services.plan_quality import PlanQualityError, validate_trip_plan_for_request
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
+from app.utils.json_utils import strip_json_fence
 
 
 class LLMPlannerAgent(BaseAgent):
@@ -136,7 +137,7 @@ class LLMPlannerAgent(BaseAgent):
             return trip_plan, correction_usage
 
     def _load_trip_plan(self, text: str) -> TripPlan:
-        payload = json.loads(self._strip_json_fence(text))
+        payload = json.loads(strip_json_fence(text))
         return TripPlan.model_validate(payload)
 
     async def _refine_with_critique(
@@ -252,15 +253,3 @@ class LLMPlannerAgent(BaseAgent):
         primary.completion_tokens += extra.completion_tokens
         primary.total_tokens += extra.total_tokens
         return primary
-
-    @staticmethod
-    def _strip_json_fence(text: str) -> str:
-        cleaned = (text or "").strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            cleaned = "\n".join(lines).strip()
-        return cleaned

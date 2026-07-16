@@ -6,15 +6,10 @@ from app.tools.base import BaseTool
 
 
 class ToolRegistry:
-    """Singleton registry for tools."""
+    """Registry for one coherent set of tool instances."""
 
-    _instance: Optional["ToolRegistry"] = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._tools = {}
-        return cls._instance
+    def __init__(self):
+        self._tools: Dict[str, BaseTool] = {}
 
     def register(self, tool: BaseTool) -> None:
         if tool.name in self._tools:

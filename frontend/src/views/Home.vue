@@ -87,7 +87,21 @@
 <script setup lang="ts">
 import dayjs, { Dayjs } from 'dayjs'
 import { computed, ref } from 'vue'
-import { message } from 'ant-design-vue'
+import {
+  Button as AButton,
+  Col as ACol,
+  Form as AForm,
+  FormItem as AFormItem,
+  Input as AInput,
+  message,
+  Progress as AProgress,
+  RangePicker as ARangePicker,
+  Row as ARow,
+  Segmented as ASegmented,
+  Select as ASelect,
+  Space as ASpace,
+  TypographyText as ATypographyText
+} from 'ant-design-vue'
 import { storeToRefs } from 'pinia'
 import { MapPinned, Sparkles } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'

@@ -23,7 +23,10 @@
             <template #icon><X :size="16" /></template>
             取消
           </a-button>
-          <a-button v-if="tripPlan" @click="router.push({ name: 'conversation' })">
+          <a-button
+            v-if="tripPlan"
+            @click="router.push({ name: 'conversation', query: { planId: tripPlan.plan_id } })"
+          >
             对话调整
           </a-button>
           <a-dropdown>
@@ -45,7 +48,13 @@
         </a-space>
       </header>
 
-      <div v-if="!tripPlan" class="empty-state">
+      <a-alert v-if="error && !tripPlan" type="error" show-icon :message="error" />
+
+      <div v-if="loading" class="empty-state">
+        <a-spin size="large" tip="正在加载行程..." />
+      </div>
+
+      <div v-else-if="!tripPlan" class="empty-state">
         <a-empty description="暂无行程数据" />
       </div>
 
@@ -209,8 +218,26 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted } from 'vue'
-import { message } from 'ant-design-vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import {
+  Alert as AAlert,
+  Button as AButton,
+  Descriptions as ADescriptions,
+  DescriptionsItem as ADescriptionsItem,
+  Divider as ADivider,
+  Dropdown as ADropdown,
+  Empty as AEmpty,
+  Menu as AMenu,
+  MenuItem as AMenuItem,
+  message,
+  Rate as ARate,
+  Space as ASpace,
+  Spin as ASpin,
+  Tag as ATag,
+  Tooltip as ATooltip,
+  TypographyParagraph as ATypographyParagraph,
+  TypographyText as ATypographyText
+} from 'ant-design-vue'
 import { storeToRefs } from 'pinia'
 import {
   ArrowDown,
@@ -225,16 +252,23 @@ import {
   Trash2,
   X
 } from 'lucide-vue-next'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useExport } from '../composables/useExport'
 import { useMap } from '../composables/useMap'
 import { useTripPlanStore } from '../stores/tripPlanStore'
 
 const router = useRouter()
+const route = useRoute()
 const tripPlanStore = useTripPlanStore()
-const { currentPlan: tripPlan } = storeToRefs(tripPlanStore)
+const { currentPlan: tripPlan, error, loading } = storeToRefs(tripPlanStore)
 const editMode = computed(() => tripPlanStore.planStatus === 'editing')
-const activeSection = computed(() => 'overview')
+const activeSection = ref('overview')
+const sectionIds = ['overview', 'budget', 'map', 'itinerary', 'weather'] as const
+const routePlanId = computed(() => {
+  const value = route.params.planId
+  if (Array.isArray(value)) return value[0] || null
+  return typeof value === 'string' && value ? value : null
+})
 const { exporting, exportAsImage: exportImage, exportAsPDF: exportPDF } = useExport()
 const { allAttractions, mapReady, initMap } = useMap(tripPlan)
 
@@ -244,11 +278,15 @@ const startEdit = () => {
 
 const saveChanges = async () => {
   if (!tripPlan.value) return
-  tripPlanStore.recalculateBudget()
-  await tripPlanStore.saveEdit('手动编辑')
-  message.success('修改已保存')
-  await nextTick()
-  initMap()
+  try {
+    tripPlanStore.recalculateBudget()
+    await tripPlanStore.saveEdit('手动编辑')
+    message.success('修改已保存')
+    await nextTick()
+    await initMap()
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : '保存修改失败')
+  }
 }
 
 const cancelEdit = () => {
@@ -263,21 +301,54 @@ const deleteAttraction = (dayIndex: number, attractionIndex: number) => {
   tripPlanStore.deleteAttraction(dayIndex, attractionIndex)
 }
 
-const scrollToSection = ({ key }: { key: string }) => {
-  document.getElementById(key)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+const scrollToSection = ({ key }: { key: unknown }) => {
+  const sectionId = String(key)
+  if (sectionIds.includes(sectionId as (typeof sectionIds)[number])) activeSection.value = sectionId
+  document.getElementById(sectionId)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+const updateActiveSection = () => {
+  let visibleSection = 'overview'
+  sectionIds.forEach(sectionId => {
+    const section = document.getElementById(sectionId)
+    if (section && section.getBoundingClientRect().top <= 160) visibleSection = sectionId
+  })
+  activeSection.value = visibleSection
 }
 
 const exportAsImage = async () => {
   if (!tripPlan.value) return
-  await exportImage('trip-plan-content', `${tripPlan.value.city}旅行计划`)
+  try {
+    await exportImage('trip-plan-content', `${tripPlan.value.city}旅行计划`)
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : '导出图片失败')
+  }
 }
 
 const exportAsPDF = async () => {
   if (!tripPlan.value) return
-  await exportPDF('trip-plan-content', `${tripPlan.value.city}旅行计划`)
+  try {
+    await exportPDF('trip-plan-content', `${tripPlan.value.city}旅行计划`)
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : '导出 PDF 失败')
+  }
 }
 
-onMounted(() => {
-  initMap()
+onMounted(async () => {
+  window.addEventListener('scroll', updateActiveSection, { passive: true })
+  try {
+    if (routePlanId.value && tripPlanStore.planId !== routePlanId.value) {
+      await tripPlanStore.loadPlan(routePlanId.value)
+    }
+    if (tripPlan.value) {
+      await nextTick()
+      await initMap()
+      updateActiveSection()
+    }
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : '加载行程失败')
+  }
 })
+
+onBeforeUnmount(() => window.removeEventListener('scroll', updateActiveSection))
 </script>

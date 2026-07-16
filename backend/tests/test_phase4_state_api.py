@@ -21,6 +21,7 @@ class FakeStateService:
             "budget": None,
         }
         self.versions = [{"version": 1, "change_summary": "初始创建", "created_at": "2026-06-29T10:00:00Z"}]
+        self.saved_items = []
 
     async def create_session(self):
         return {
@@ -108,6 +109,21 @@ class FakeStateService:
     async def update_preferences(self, user_id, request):
         return request.model_dump()
 
+    async def list_saved_items(self, user_id):
+        return self.saved_items
+
+    async def create_saved_item(self, user_id, request):
+        item = {
+            **request.model_dump(),
+            "id": "44444444-4444-4444-4444-444444444444",
+            "created_at": "2026-06-29T10:02:00Z",
+        }
+        self.saved_items.insert(0, item)
+        return item
+
+    async def delete_saved_item(self, user_id, item_id):
+        self.saved_items = [item for item in self.saved_items if item["id"] != item_id]
+
     async def _get_user_by_session(self, session_id):
         from types import SimpleNamespace
         return SimpleNamespace(id="22222222-2222-2222-2222-222222222222")
@@ -143,7 +159,7 @@ def test_phase4_trip_plan_crud_and_versions():
         session_id = "11111111-1111-1111-1111-111111111111"
 
         created = client.post(
-            "/api/trip/plan",
+        "/api/trip/plan/sync",
             json={
                 "session_id": session_id,
                 "city": "北京",
@@ -210,3 +226,30 @@ def test_phase4_conversation_and_preferences_endpoints():
         )
         assert updated.status_code == 200
         assert updated.json()["favorite_cities"] == ["杭州"]
+
+
+def test_saved_item_endpoints_persist_and_delete_items():
+    with client_with_fake_state() as (client, _):
+        session_id = "11111111-1111-1111-1111-111111111111"
+        created = client.post(
+            f"/api/saved-items?session_id={session_id}",
+            json={
+                "item_type": "attraction",
+                "item_data": {"name": "故宫", "city": "北京"},
+                "tags": ["历史文化"],
+                "note": "上午参观",
+            },
+        )
+
+        assert created.status_code == 201
+        assert created.json()["item_data"]["name"] == "故宫"
+
+        listed = client.get(f"/api/saved-items?session_id={session_id}")
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()] == [created.json()["id"]]
+
+        deleted = client.delete(
+            f"/api/saved-items/{created.json()['id']}?session_id={session_id}"
+        )
+        assert deleted.status_code == 204
+        assert client.get(f"/api/saved-items?session_id={session_id}").json() == []

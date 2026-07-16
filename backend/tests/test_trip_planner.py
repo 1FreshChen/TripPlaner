@@ -1,8 +1,9 @@
 import asyncio
+from datetime import date, timedelta
 
 from app.agents.prompts import PLANNER_AGENT_PROMPT_LEGACY
-from app.agents.trip_planner import PlannerAgent, TripPlannerAgent
-from app.models.schemas import TripPlanRequest
+from app.agents.trip_planner import PlannerAgent, TripPlannerAgent, WeatherQueryAgent
+from app.models.schemas import TripPlanRequest, WeatherInfo
 from app.services.mock_data import build_mock_attractions, build_mock_hotels, build_mock_weather
 
 
@@ -15,6 +16,44 @@ class RecordingLLMService:
         self.system_prompt = system_prompt
         self.user_prompt = user_prompt
         return None
+
+
+class FakeWeatherService:
+    def __init__(self, weather):
+        self.weather = weather
+
+    def get_weather(self, city):
+        return self.weather
+
+
+def _ascii_request(start_date="2026-07-23", days=5):
+    start = date.fromisoformat(start_date)
+    return TripPlanRequest(
+        city="TestCity",
+        start_date=start_date,
+        end_date=(start + timedelta(days=days - 1)).isoformat(),
+        days=days,
+        preferences="museums",
+        budget="medium",
+        transportation="public transit",
+        accommodation="economy hotel",
+    )
+
+
+def _weather_from(start_date, days):
+    start = date.fromisoformat(start_date)
+    return [
+        WeatherInfo(
+            date=(start + timedelta(days=index)).isoformat(),
+            day_weather="ProviderSunny",
+            night_weather="ProviderCloudy",
+            day_temp=25 + index,
+            night_temp=18 + index,
+            wind_direction="east",
+            wind_power="3",
+        )
+        for index in range(days)
+    ]
 
 
 def test_trip_planner_generates_mock_plan_without_api_keys():
@@ -43,6 +82,47 @@ def test_trip_planner_generates_mock_plan_without_api_keys():
         + plan.budget.total_meals
         + plan.budget.total_transportation
     )
+
+
+def test_weather_query_ignores_external_forecast_that_does_not_cover_request_dates():
+    request = _ascii_request()
+    provider_weather = _weather_from("2026-07-12", 4)
+    agent = WeatherQueryAgent(FakeWeatherService(provider_weather), enable_external_services=True)
+
+    weather = agent.run(request)
+
+    assert [item.date for item in weather] == [
+        "2026-07-23",
+        "2026-07-24",
+        "2026-07-25",
+        "2026-07-26",
+        "2026-07-27",
+    ]
+
+
+def test_weather_query_falls_back_when_external_forecast_is_missing():
+    request = _ascii_request()
+    agent = WeatherQueryAgent(FakeWeatherService(None), enable_external_services=True)
+
+    weather = agent.run(request)
+
+    assert [item.date for item in weather] == [
+        "2026-07-23",
+        "2026-07-24",
+        "2026-07-25",
+        "2026-07-26",
+        "2026-07-27",
+    ]
+
+
+def test_weather_query_uses_external_forecast_when_it_covers_request_dates():
+    request = _ascii_request()
+    provider_weather = _weather_from("2026-07-23", 5)
+    agent = WeatherQueryAgent(FakeWeatherService(provider_weather), enable_external_services=True)
+
+    weather = agent.run(request)
+
+    assert weather == provider_weather
 
 
 def test_trip_planner_async_entry_uses_orchestration_without_api_keys():

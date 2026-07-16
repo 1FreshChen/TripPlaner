@@ -78,6 +78,7 @@ class AgentOrchestrator:
                 result.status = AgentStatus.COMPLETED
                 result.output = output
                 result.retries_used = attempt
+                self._clear_agent_failure_flags(context, agent_name)
                 self._finish_result(result, trace)
                 return result
             except Exception as exc:
@@ -105,6 +106,7 @@ class AgentOrchestrator:
             result.status = AgentStatus.COMPLETED
             result.output = fallback_output
             result.fallback_used = self._fallback_chain.last_level_used
+            self._clear_agent_failure_flags(context, agent_name, clear_candidate_metadata=True)
         else:
             result.status = AgentStatus.FAILED
             result.error_message = str(last_error) if last_error else "unknown error"
@@ -117,6 +119,19 @@ class AgentOrchestrator:
         result.finished_at = time.time()
         result.duration_ms = (result.finished_at - result.started_at) * 1000
         trace.agent_results.append(result)
+
+    @staticmethod
+    def _clear_agent_failure_flags(
+        context: Dict[str, Any],
+        agent_name: str,
+        *,
+        clear_candidate_metadata: bool = False,
+    ) -> None:
+        context.pop(f"{agent_name}_quality_failed", None)
+        if agent_name == "trip_planner" and clear_candidate_metadata:
+            critique_events = context.pop("plan_critique_events", None)
+            if critique_events:
+                context.setdefault("failed_plan_critique_events", []).extend(critique_events)
 
     @staticmethod
     def _failed_result(agent_name: str, exc: Exception) -> AgentResult:

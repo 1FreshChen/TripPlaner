@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
 
 from app.services.amap_service import AmapService
@@ -41,7 +42,12 @@ class HotelSearchTool(BaseTool):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         normalized_limit = max(1, min(limit, 10))
-        pois = self._amap.search_pois(f"{hotel_type} 酒店", city, normalized_limit)
+        pois = await asyncio.to_thread(
+            self._amap.search_pois,
+            f"{hotel_type} 酒店",
+            city,
+            normalized_limit,
+        )
         hotels = [
             hotel
             for hotel in (self._amap.poi_to_hotel(poi, hotel_type) for poi in pois)
