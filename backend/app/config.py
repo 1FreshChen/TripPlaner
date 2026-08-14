@@ -45,6 +45,16 @@ class Settings(BaseSettings):
     task_result_ttl_days: int = Field(default=30, ge=1, alias="TASK_RESULT_TTL_DAYS")
     task_worker_timeout_seconds: int = Field(default=900, ge=30, alias="TASK_WORKER_TIMEOUT_SECONDS")
     task_sse_timeout_seconds: int = Field(default=300, ge=30, alias="TASK_SSE_TIMEOUT_SECONDS")
+    task_maintenance_interval_seconds: int = Field(
+        default=60,
+        ge=10,
+        alias="TASK_MAINTENANCE_INTERVAL_SECONDS",
+    )
+    task_stale_queued_seconds: int = Field(
+        default=300,
+        ge=60,
+        alias="TASK_STALE_QUEUED_SECONDS",
+    )
     encryption_key: str = Field(default="", alias="ENCRYPTION_KEY")
     max_conversation_messages: int = Field(default=20, alias="MAX_CONVERSATION_MESSAGES")
     rate_limit_per_minute: int = Field(default=5, alias="RATE_LIMIT_PER_MINUTE")
@@ -55,4 +65,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

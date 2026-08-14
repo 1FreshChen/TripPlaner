@@ -202,6 +202,7 @@ class StateService:
         planner_token_usage = getattr(planner, "last_token_usage", None)
         planner_tool_calls = getattr(planner, "last_tool_calls", [])
         planner_critique_events = getattr(planner, "last_critique_events", [])
+        planner_trace = getattr(planner, "last_trace", None)
         await self._report_progress(progress_callback, "validating", 90, "正在校验行程质量")
         self._ensure_completed_plan_is_publishable(request, trip_plan, planner_critique_events)
 
@@ -224,6 +225,25 @@ class StateService:
                     "count": len(planner_tool_calls),
                     "tool_calls": planner_tool_calls,
                 },
+            )
+        fallback_results = [
+            {
+                "agent": result.agent_name,
+                "fallback": result.fallback_used.value,
+                "error": result.error_message,
+            }
+            for result in (planner_trace.agent_results if planner_trace else [])
+            if result.fallback_used is not None
+        ]
+        if fallback_results:
+            self._add_audit_event(
+                event_type="trip_planner_fallback_used",
+                action="external_service_fallback",
+                severity="warning",
+                session_id=session_uuid,
+                resource_type="trip_plan",
+                resource_id=plan.id,
+                details_json={"fallbacks": fallback_results},
             )
         for event in planner_critique_events:
             self._add_audit_event(
@@ -274,17 +294,37 @@ class StateService:
         if callback is not None:
             await callback(phase, progress, message)
 
-    async def get_trip_plan(self, plan_id: str) -> TripPlanResponse:
-        plan = await self._get_plan(plan_id)
+    async def get_trip_plan(self, plan_id: str, session_id: str | None = None) -> TripPlanResponse:
+        plan = await self._get_plan(plan_id, session_id=session_id)
         return self._plan_response(plan)
 
-    async def update_trip_plan(self, plan_id: str, update: TripPlanUpdateRequest) -> TripPlanResponse:
-        plan = await self._get_plan(plan_id)
+    async def update_trip_plan(
+        self,
+        plan_id: str,
+        update: TripPlanUpdateRequest,
+        session_id: str | None = None,
+    ) -> TripPlanResponse:
+        plan = await self._get_plan(plan_id, session_id=session_id, for_update=True)
+        if update.expected_version != plan.version:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"版本冲突：您的修改基于版本 {update.expected_version}，"
+                    f"但当前已是版本 {plan.version}。请刷新后重新编辑。"
+                ),
+            )
+
+        try:
+            new_start_date = date.fromisoformat(update.plan_json.start_date)
+            new_end_date = date.fromisoformat(update.plan_json.end_date)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"行程日期格式无效: {exc}") from exc
+
         plan.version += 1
-        plan.status = "editing"
+        plan.status = "completed"
         plan.city = update.plan_json.city
-        plan.start_date = date.fromisoformat(update.plan_json.start_date)
-        plan.end_date = date.fromisoformat(update.plan_json.end_date)
+        plan.start_date = new_start_date
+        plan.end_date = new_end_date
         plan.days_count = len(update.plan_json.days)
         plan.plan_json = update.plan_json.model_dump()
         plan.overall_suggestions = update.plan_json.overall_suggestions
@@ -310,8 +350,8 @@ class StateService:
         await self._db.flush()
         return self._plan_response(plan, update.plan_json)
 
-    async def list_plan_versions(self, plan_id: str) -> PlanVersionsResponse:
-        plan = await self._get_plan(plan_id)
+    async def list_plan_versions(self, plan_id: str, session_id: str | None = None) -> PlanVersionsResponse:
+        plan = await self._get_plan(plan_id, session_id=session_id)
         versions = (
             await self._db.execute(
                 select(TripPlanVersion)
@@ -326,8 +366,13 @@ class StateService:
             ]
         )
 
-    async def revert_plan(self, plan_id: str, version: int) -> TripPlanResponse:
-        plan = await self._get_plan(plan_id)
+    async def revert_plan(
+        self,
+        plan_id: str,
+        version: int,
+        session_id: str | None = None,
+    ) -> TripPlanResponse:
+        plan = await self._get_plan(plan_id, session_id=session_id, for_update=True)
         target = await self._db.scalar(
             select(TripPlanVersion).where(
                 TripPlanVersion.trip_plan_id == plan.id,
@@ -359,8 +404,8 @@ class StateService:
         await self._db.flush()
         return self._plan_response(plan, restored)
 
-    async def archive_plan(self, plan_id: str) -> None:
-        plan = await self._get_plan(plan_id)
+    async def archive_plan(self, plan_id: str, session_id: str | None = None) -> None:
+        plan = await self._get_plan(plan_id, session_id=session_id, for_update=True)
         plan.status = "archived"
         self._add_audit_event(
             event_type="trip_plan_archived",
@@ -487,30 +532,42 @@ class StateService:
         plan_update_failed = False
         if referenced_plan is not None and intent_decision.should_modify:
             try:
-                updated_plan = await self._modify_plan_via_conversation(
-                    llm=llm,
-                    tool_executor=executor,
-                    referenced_plan=referenced_plan,
-                    user_message=request.message,
-                    modification_instruction=intent_decision.instruction,
-                    session_uuid=session_uuid,
-                    conversation_id=assistant_id,
-                )
+                begin_nested = getattr(self._db, "begin_nested", None)
+                if begin_nested is None:
+                    updated_plan = await self._modify_plan_via_conversation(
+                        llm=llm,
+                        tool_executor=executor,
+                        referenced_plan=referenced_plan,
+                        user_message=request.message,
+                        modification_instruction=intent_decision.instruction,
+                        session_uuid=session_uuid,
+                        conversation_id=assistant_id,
+                    )
+                else:
+                    async with begin_nested():
+                        updated_plan = await self._modify_plan_via_conversation(
+                            llm=llm,
+                            tool_executor=executor,
+                            referenced_plan=referenced_plan,
+                            user_message=request.message,
+                            modification_instruction=intent_decision.instruction,
+                            session_uuid=session_uuid,
+                            conversation_id=assistant_id,
+                        )
                 if updated_plan:
                     content = f"行程已更新（版本 {updated_plan.version}）\n\n{content}"
             except Exception as exc:
                 plan_update_failed = True
                 logger.warning("Conversation plan modification failed: %s", exc, exc_info=True)
-                if not isinstance(exc, PlanModificationError):
-                    self._add_audit_event(
-                        event_type="trip_plan_conversation_update_failed",
-                        action="conversation_modify_plan",
-                        severity="warning",
-                        session_id=session_uuid,
-                        resource_type="trip_plan",
-                        resource_id=referenced_plan.id,
-                        details_json={"error": str(exc), "message": request.message[:200]},
-                    )
+                self._add_audit_event(
+                    event_type="trip_plan_conversation_update_failed",
+                    action="conversation_modify_plan",
+                    severity="warning",
+                    session_id=session_uuid,
+                    resource_type="trip_plan",
+                    resource_id=referenced_plan.id,
+                    details_json={"error": str(exc), "message": request.message[:200]},
+                )
                 content = (
                     f"{content}\n\n"
                     "⚠️ 我理解你想调整行程，但这次没有成功保存修改，当前行程未变化。"
@@ -753,11 +810,18 @@ class StateService:
                 last_error = "修改后的 TripPlan 与原计划完全相同，用户要求尚未落实"
                 continue
 
+            try:
+                new_start_date = date.fromisoformat(modified_plan.start_date)
+                new_end_date = date.fromisoformat(modified_plan.end_date)
+            except (TypeError, ValueError) as exc:
+                last_error = f"日期解析失败: {exc}"
+                continue
+
             referenced_plan.version += 1
             referenced_plan.status = "completed"
             referenced_plan.city = modified_plan.city
-            referenced_plan.start_date = date.fromisoformat(modified_plan.start_date)
-            referenced_plan.end_date = date.fromisoformat(modified_plan.end_date)
+            referenced_plan.start_date = new_start_date
+            referenced_plan.end_date = new_end_date
             referenced_plan.days_count = len(modified_plan.days)
             referenced_plan.plan_json = modified_plan.model_dump()
             referenced_plan.overall_suggestions = modified_plan.overall_suggestions
@@ -787,15 +851,6 @@ class StateService:
             await self._db.flush()
             return self._plan_response(referenced_plan, modified_plan)
 
-        self._add_audit_event(
-            event_type="trip_plan_conversation_update_failed",
-            action="conversation_modify_plan",
-            severity="warning",
-            session_id=session_uuid,
-            resource_type="trip_plan",
-            resource_id=referenced_plan.id,
-            details_json={"error": last_error, "message": user_message[:200]},
-        )
         raise PlanModificationError(last_error or "LLM did not return a valid TripPlan JSON")
 
     @staticmethod
@@ -1049,10 +1104,25 @@ class StateService:
         await self._db.flush()
         return user
 
-    async def _get_plan(self, plan_id: str) -> TripPlanModel:
+    async def _get_plan(
+        self,
+        plan_id: str,
+        session_id: str | None = None,
+        *,
+        for_update: bool = False,
+    ) -> TripPlanModel:
         plan_uuid = _parse_uuid(plan_id, "plan_id")
-        plan = await self._db.scalar(select(TripPlanModel).where(TripPlanModel.id == plan_uuid))
-        if plan is None or plan.status == "archived":
+        statement = select(TripPlanModel).where(
+            TripPlanModel.id == plan_uuid,
+            TripPlanModel.status != "archived",
+        )
+        if session_id is not None:
+            session_uuid = _parse_uuid(session_id, "session_id")
+            statement = statement.where(TripPlanModel.session_id == session_uuid)
+        if for_update:
+            statement = statement.with_for_update()
+        plan = await self._db.scalar(statement)
+        if plan is None:
             raise HTTPException(status_code=404, detail="计划不存在")
         return plan
 

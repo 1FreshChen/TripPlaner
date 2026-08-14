@@ -224,6 +224,8 @@ TaskPhase = Literal[
     "saving",
     "completed",
     "failed",
+    "cancelled",
+    "expired",
 ]
 
 
@@ -262,6 +264,7 @@ class TripPlanUpdateRequest(BaseModel):
     """旅行计划编辑请求"""
 
     plan_json: TripPlan = Field(..., description="修改后的完整旅行计划")
+    expected_version: int = Field(..., ge=1, description="客户端当前持有的版本号，用于冲突检测")
     change_summary: str = Field(default="手动编辑", description="修改摘要")
 
     @field_validator("change_summary", mode="before")

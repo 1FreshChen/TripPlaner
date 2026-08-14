@@ -11,13 +11,12 @@
   },
   "dependencies": {
     "@amap/amap-jsapi-loader": "^1.0.1",
-    "@vitejs/plugin-vue": "^5.0.5",
     "@vueuse/core": "^10.11.0",
     "ant-design-vue": "^4.2.3",
-    "axios": "^1.7.2",
+    "axios": "^1.19.0",
     "dayjs": "^1.11.11",
     "html2canvas": "^1.4.1",
-    "jspdf": "^2.5.1",
+    "jspdf": "^4.2.1",
     "lucide-vue-next": "^0.468.0",
     "pinia": "^2.1.7",
     "pinia-plugin-persistedstate": "^3.2.1",
@@ -25,8 +24,9 @@
     "vue-router": "^4.3.3"
   },
   "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
     "typescript": "^5.4.5",
-    "vite": "^5.3.1",
+    "vite": "^6.4.3",
     "vue-tsc": "^2.0.21"
   }
 }

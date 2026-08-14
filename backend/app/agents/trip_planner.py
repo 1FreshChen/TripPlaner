@@ -13,7 +13,7 @@ from app.models.schemas import Attraction, DayPlan, Hotel, TripPlan, TripPlanReq
 from app.orchestration.base import AgentStatus, BaseAgent, ExecutionTrace
 from app.orchestration.orchestrator import AgentOrchestrator
 from app.orchestration.trace import ExecutionTracer
-from app.services.amap_service import AmapService
+from app.services.amap_service import AmapService, unwrap_service_result
 from app.services.amap_mcp_service import get_amap_mcp_service
 from app.services.budget import calculate_budget
 from app.services.llm_service import LLMService
@@ -174,7 +174,9 @@ class AttractionSearchAgent(BaseAgent):
     def run(self, request: TripPlanRequest) -> List[Attraction]:
         keyword = self._keyword_from_preferences(request.preferences)
         if self.enable_external_services:
-            pois = self.amap_service.search_pois(keyword, request.city, offset=max(request.days * 3, 10))
+            pois = unwrap_service_result(
+                self.amap_service.search_pois(keyword, request.city, offset=max(request.days * 3, 10))
+            )
             attractions = [
                 attraction
                 for attraction in (self.amap_service.poi_to_attraction(poi, request.preferences) for poi in pois)
@@ -213,7 +215,7 @@ class WeatherQueryAgent(BaseAgent):
 
     def run(self, request: TripPlanRequest) -> List[WeatherInfo]:
         if self.enable_external_services:
-            weather = self.amap_service.get_weather(request.city)
+            weather = unwrap_service_result(self.amap_service.get_weather(request.city))
             if weather:
                 matching_weather = self._select_weather_for_request(weather, request)
                 if matching_weather:
@@ -254,7 +256,9 @@ class HotelAgent(BaseAgent):
 
     def run(self, request: TripPlanRequest) -> List[Hotel]:
         if self.enable_external_services:
-            pois = self.amap_service.search_pois(f"{request.accommodation} 酒店", request.city, offset=5)
+            pois = unwrap_service_result(
+                self.amap_service.search_pois(f"{request.accommodation} 酒店", request.city, offset=5)
+            )
             hotels = [
                 hotel
                 for hotel in (self.amap_service.poi_to_hotel(poi, request.accommodation) for poi in pois)

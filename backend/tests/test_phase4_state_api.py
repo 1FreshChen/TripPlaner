@@ -56,22 +56,22 @@ class FakeStateService:
         self.plan["city"] = request.city
         return self.plan
 
-    async def get_trip_plan(self, plan_id):
+    async def get_trip_plan(self, plan_id, session_id=None):
         return {**self.plan, "plan_id": plan_id}
 
-    async def update_trip_plan(self, plan_id, update):
-        self.plan = {**update.plan_json.model_dump(), "plan_id": plan_id, "status": "editing", "version": 2}
+    async def update_trip_plan(self, plan_id, update, session_id=None):
+        self.plan = {**update.plan_json.model_dump(), "plan_id": plan_id, "status": "completed", "version": 2}
         self.versions.insert(0, {"version": 2, "change_summary": update.change_summary, "created_at": "2026-06-29T10:01:00Z"})
         return self.plan
 
-    async def list_plan_versions(self, plan_id):
+    async def list_plan_versions(self, plan_id, session_id=None):
         return {"versions": self.versions}
 
-    async def revert_plan(self, plan_id, version):
+    async def revert_plan(self, plan_id, version, session_id=None):
         self.plan = {**self.plan, "plan_id": plan_id, "status": "completed", "version": 3}
         return self.plan
 
-    async def archive_plan(self, plan_id):
+    async def archive_plan(self, plan_id, session_id=None):
         self.plan["status"] = "archived"
 
     async def send_conversation_message(self, session_id, request):
@@ -157,9 +157,11 @@ def test_phase4_session_endpoints():
 def test_phase4_trip_plan_crud_and_versions():
     with client_with_fake_state() as (client, _):
         session_id = "11111111-1111-1111-1111-111111111111"
+        headers = {"X-Session-ID": session_id}
 
         created = client.post(
-        "/api/trip/plan/sync",
+            "/api/trip/plan/sync",
+            headers=headers,
             json={
                 "session_id": session_id,
                 "city": "北京",
@@ -180,21 +182,22 @@ def test_phase4_trip_plan_crud_and_versions():
         plan["overall_suggestions"] = "已调整"
         updated = client.put(
             "/api/trip/plan/plan-1",
-            json={"plan_json": plan, "change_summary": "调整总体建议"},
+            headers=headers,
+            json={"plan_json": plan, "expected_version": 1, "change_summary": "调整总体建议"},
         )
         assert updated.status_code == 200
         assert updated.json()["version"] == 2
-        assert updated.json()["status"] == "editing"
+        assert updated.json()["status"] == "completed"
 
-        versions = client.get("/api/trip/plan/plan-1/versions")
+        versions = client.get("/api/trip/plan/plan-1/versions", headers=headers)
         assert versions.status_code == 200
         assert versions.json()["versions"][0]["version"] == 2
 
-        reverted = client.post("/api/trip/plan/plan-1/revert/1")
+        reverted = client.post("/api/trip/plan/plan-1/revert/1", headers=headers)
         assert reverted.status_code == 200
         assert reverted.json()["version"] == 3
 
-        archived = client.delete("/api/trip/plan/plan-1")
+        archived = client.delete("/api/trip/plan/plan-1", headers=headers)
         assert archived.status_code == 204
 
 

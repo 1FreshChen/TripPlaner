@@ -145,6 +145,7 @@ def test_orchestrator_uses_fallback_chain_after_retries_are_exhausted():
     assert result.status == AgentStatus.COMPLETED
     assert result.output == "deterministic result"
     assert result.fallback_used == FallbackLevel.DETERMINISTIC
+    assert result.error_message == "service unavailable"
     assert trace.any_fallback_used is True
 
 

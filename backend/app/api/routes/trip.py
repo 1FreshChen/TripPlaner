@@ -1,8 +1,9 @@
 import asyncio
 import json
 import time
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_state_service, get_trip_task_reader, get_trip_task_service
@@ -23,6 +24,13 @@ from app.tasks.queue import TaskQueue, get_task_queue
 
 
 router = APIRouter(prefix="/trip", tags=["trip"])
+SessionHeader = Annotated[str, Header(alias="X-Session-ID", min_length=1)]
+
+
+def _bind_request_session(trip_request: TripPlanRequest, session_id: str) -> TripPlanRequest:
+    if trip_request.session_id and trip_request.session_id != session_id:
+        raise HTTPException(status_code=403, detail="请求会话与认证会话不一致")
+    return trip_request.model_copy(update={"session_id": session_id})
 
 
 @router.post("/plan", response_model=TripPlanTaskCreatedResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -31,9 +39,11 @@ router = APIRouter(prefix="/trip", tags=["trip"])
 async def create_trip_plan(
     request: Request,
     trip_request: TripPlanRequest,
+    session_id: SessionHeader,
     tasks: TripPlanTaskService = Depends(get_trip_task_service),
     queue: TaskQueue = Depends(get_task_queue),
 ) -> TripPlanTaskCreatedResponse:
+    trip_request = _bind_request_session(trip_request, session_id)
     created = await tasks.create_task(trip_request)
     await tasks.commit()
     try:
@@ -57,10 +67,11 @@ async def create_trip_plan(
 async def create_trip_plan_sync(
     request: Request,
     trip_request: TripPlanRequest,
+    session_id: SessionHeader,
     state: StateService = Depends(get_state_service),
 ) -> TripPlanResponse:
     """Compatibility endpoint for restoring the original synchronous workflow."""
-    return await state.create_trip_plan(trip_request)
+    return await state.create_trip_plan(_bind_request_session(trip_request, session_id))
 
 
 @router.get("/tasks/{task_id}", response_model=TripPlanTaskStatusResponse)
@@ -68,9 +79,10 @@ async def create_trip_plan_sync(
 async def get_trip_plan_task(
     request: Request,
     task_id: str,
+    session_id: SessionHeader,
     tasks: TripPlanTaskService = Depends(get_trip_task_service),
 ) -> TripPlanTaskStatusResponse:
-    return await tasks.get_status(task_id)
+    return await tasks.get_status(task_id, session_id=session_id)
 
 
 @router.get("/tasks/{task_id}/result", response_model=TripPlanResponse | TripPlanTaskPendingResult)
@@ -78,9 +90,10 @@ async def get_trip_plan_task(
 async def get_trip_plan_task_result(
     request: Request,
     task_id: str,
+    session_id: SessionHeader,
     tasks: TripPlanTaskService = Depends(get_trip_task_service),
 ) -> TripPlanResponse | TripPlanTaskPendingResult:
-    return await tasks.get_result(task_id)
+    return await tasks.get_result(task_id, session_id=session_id)
 
 
 @router.get("/tasks/{task_id}/events")
@@ -88,9 +101,10 @@ async def get_trip_plan_task_result(
 async def stream_trip_plan_task_events(
     request: Request,
     task_id: str,
+    session_id: SessionHeader,
     tasks: TripPlanTaskReader = Depends(get_trip_task_reader),
 ) -> StreamingResponse:
-    initial_status = await tasks.get_status(task_id)
+    initial_status = await tasks.get_status(task_id, session_id=session_id)
     connection_timeout = get_settings().task_sse_timeout_seconds
 
     async def event_stream():
@@ -128,7 +142,7 @@ async def stream_trip_plan_task_events(
             if await request.is_disconnected():
                 return
             await asyncio.sleep(0.75)
-            current = await tasks.get_status(task_id)
+            current = await tasks.get_status(task_id, session_id=session_id)
 
     return StreamingResponse(
         event_stream(),
@@ -146,9 +160,10 @@ async def stream_trip_plan_task_events(
 async def get_trip_plan(
     request: Request,
     plan_id: str,
+    session_id: SessionHeader,
     state: StateService = Depends(get_state_service),
 ) -> TripPlanResponse:
-    return await state.get_trip_plan(plan_id)
+    return await state.get_trip_plan(plan_id, session_id=session_id)
 
 
 @router.put("/plan/{plan_id}", response_model=TripPlanResponse)
@@ -157,9 +172,10 @@ async def update_trip_plan(
     request: Request,
     plan_id: str,
     trip_update: TripPlanUpdateRequest,
+    session_id: SessionHeader,
     state: StateService = Depends(get_state_service),
 ) -> TripPlanResponse:
-    return await state.update_trip_plan(plan_id, trip_update)
+    return await state.update_trip_plan(plan_id, trip_update, session_id=session_id)
 
 
 @router.get("/plan/{plan_id}/versions", response_model=PlanVersionsResponse)
@@ -167,9 +183,10 @@ async def update_trip_plan(
 async def get_plan_versions(
     request: Request,
     plan_id: str,
+    session_id: SessionHeader,
     state: StateService = Depends(get_state_service),
 ) -> PlanVersionsResponse:
-    return await state.list_plan_versions(plan_id)
+    return await state.list_plan_versions(plan_id, session_id=session_id)
 
 
 @router.post("/plan/{plan_id}/revert/{version}", response_model=TripPlanResponse)
@@ -178,9 +195,10 @@ async def revert_plan_version(
     request: Request,
     plan_id: str,
     version: int,
+    session_id: SessionHeader,
     state: StateService = Depends(get_state_service),
 ) -> TripPlanResponse:
-    return await state.revert_plan(plan_id, version)
+    return await state.revert_plan(plan_id, version, session_id=session_id)
 
 
 @router.delete("/plan/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -188,6 +206,7 @@ async def revert_plan_version(
 async def archive_trip_plan(
     request: Request,
     plan_id: str,
+    session_id: SessionHeader,
     state: StateService = Depends(get_state_service),
 ) -> None:
-    await state.archive_plan(plan_id)
+    await state.archive_plan(plan_id, session_id=session_id)

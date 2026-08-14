@@ -99,7 +99,9 @@ const phaseLabels: Record<TaskPhase, string> = {
   validating: '校验行程质量',
   saving: '保存行程和初始版本',
   completed: '行程规划完成',
-  failed: '行程生成失败'
+  failed: '行程生成失败',
+  cancelled: '任务已取消',
+  expired: '任务已过期'
 }
 
 const phaseLabel = computed(() => phaseLabels[taskPhase.value])

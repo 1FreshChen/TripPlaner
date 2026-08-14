@@ -110,6 +110,8 @@ export type TaskPhase =
   | 'saving'
   | 'completed'
   | 'failed'
+  | 'cancelled'
+  | 'expired'
 
 export interface TripPlanTaskCreatedResponse {
   task_id: string
@@ -144,6 +146,7 @@ export interface TripPlanTaskPendingResult {
 
 export interface TripPlanUpdateRequest {
   plan_json: TripPlan
+  expected_version: number
   change_summary: string
 }
 

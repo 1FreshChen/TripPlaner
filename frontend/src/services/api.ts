@@ -10,8 +10,9 @@ import type {
   TripPlanUpdateRequest,
   UserPreferences
 } from '../types'
+import { getStoredValue } from '../utils/storage'
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -19,6 +20,12 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json'
   }
+})
+
+api.interceptors.request.use(config => {
+  const sessionId = getStoredValue('session_id')
+  if (sessionId) config.headers.set('X-Session-ID', sessionId)
+  return config
 })
 
 export class ApiError extends Error {
@@ -71,8 +78,88 @@ export const getTripPlanTaskResult = async (
   return response.data
 }
 
-export const createTripPlanTaskEventSource = (taskId: string): EventSource => {
-  return new EventSource(`${API_BASE_URL}/trip/tasks/${encodeURIComponent(taskId)}/events`)
+type EventStreamListener = EventListenerOrEventListenerObject
+
+class FetchEventStream {
+  onopen: ((event: Event) => void) | null = null
+  onerror: ((event: Event) => void) | null = null
+
+  private readonly controller = new AbortController()
+  private readonly listeners = new Map<string, Set<EventStreamListener>>()
+
+  constructor(url: string, sessionId: string) {
+    void this.connect(url, sessionId)
+  }
+
+  addEventListener(type: string, listener: EventStreamListener): void {
+    const listeners = this.listeners.get(type) ?? new Set<EventStreamListener>()
+    listeners.add(listener)
+    this.listeners.set(type, listeners)
+  }
+
+  close(): void {
+    this.controller.abort()
+  }
+
+  private dispatch(type: string, data: string): void {
+    const event = new MessageEvent(type, { data })
+    for (const listener of this.listeners.get(type) ?? []) {
+      if (typeof listener === 'function') listener(event)
+      else listener.handleEvent(event)
+    }
+  }
+
+  private async connect(url: string, sessionId: string): Promise<void> {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'text/event-stream',
+          'X-Session-ID': sessionId
+        },
+        signal: this.controller.signal
+      })
+      if (!response.ok || !response.body) {
+        throw new ApiError(`进度连接失败 (${response.status})`, response.status)
+      }
+
+      this.onopen?.(new Event('open'))
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (!this.controller.signal.aborted) {
+        const { done, value } = await reader.read()
+        buffer += decoder.decode(value, { stream: !done })
+        const blocks = buffer.split(/\r?\n\r?\n/)
+        buffer = blocks.pop() ?? ''
+        for (const block of blocks) this.parseBlock(block)
+        if (done) break
+      }
+
+      if (!this.controller.signal.aborted) this.onerror?.(new Event('error'))
+    } catch (error) {
+      if (this.controller.signal.aborted) return
+      console.warn('Task event stream failed; polling will be used', error)
+      this.onerror?.(new Event('error'))
+    }
+  }
+
+  private parseBlock(block: string): void {
+    if (!block || block.startsWith(':')) return
+    let eventType = 'message'
+    const data: string[] = []
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) eventType = line.slice(6).trim()
+      else if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
+    }
+    if (data.length) this.dispatch(eventType, data.join('\n'))
+  }
+}
+
+export const createTripPlanTaskEventSource = (taskId: string): FetchEventStream => {
+  const sessionId = getStoredValue('session_id')
+  if (!sessionId) throw new ApiError('会话不存在，请刷新页面后重试', 401)
+  return new FetchEventStream(`${API_BASE_URL}/trip/tasks/${encodeURIComponent(taskId)}/events`, sessionId)
 }
 
 export const getTripPlan = async (planId: string): Promise<TripPlanResponse> => {

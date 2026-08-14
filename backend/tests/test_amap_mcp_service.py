@@ -119,7 +119,7 @@ def test_amap_mcp_service_reuses_connection_and_normalizes_results():
     weather = service.get_weather("TestCity")
 
     assert connection.start_calls == 1
-    assert pois == [
+    assert pois.data == [
         {
             "id": "poi-1",
             "name": "Test Museum",
@@ -135,9 +135,9 @@ def test_amap_mcp_service_reuses_connection_and_normalizes_results():
         "maps_search_detail",
         "maps_weather",
     ]
-    assert weather[0].date == "2026-07-15"
-    assert weather[0].day_temp == 30
-    assert weather[0].wind_direction == "east"
+    assert weather.data[0].date == "2026-07-15"
+    assert weather.data[0].day_temp == 30
+    assert weather.data[0].wind_direction == "east"
 
 
 def test_shared_mcp_tool_does_not_write_to_stdout(capsys):
@@ -229,6 +229,44 @@ def test_persistent_connection_cancels_startup_after_timeout():
     assert not connection._thread.is_alive()
 
 
+def test_persistent_connection_rebuilds_client_after_tool_timeout():
+    class Client:
+        def __init__(self, *, hangs=False):
+            self.hangs = hangs
+            self.exit_calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.exit_calls += 1
+            return False
+
+        async def list_tools(self):
+            return [{"name": "maps_weather", "description": "", "input_schema": {}}]
+
+        async def call_tool(self, tool_name, arguments):
+            if self.hangs:
+                await asyncio.Event().wait()
+            return arguments
+
+    clients = [Client(hangs=True), Client()]
+    connection = _PersistentMCPConnection(
+        server_command=["fake-server"],
+        env={},
+        startup_timeout=1,
+        call_timeout=0.05,
+        client_factory=lambda: clients.pop(0),
+    )
+
+    try:
+        with pytest.raises(TimeoutError):
+            connection.call_tool("maps_weather", {"city": "A"})
+        assert connection.call_tool("maps_weather", {"city": "B"}) == {"city": "B"}
+    finally:
+        connection.close()
+
+
 def test_get_amap_mcp_service_is_process_singleton(monkeypatch):
     settings = SimpleNamespace(
         amap_api_key="",
@@ -258,5 +296,5 @@ def test_mcp_failure_returns_empty_when_http_fallback_is_disabled():
 
     service = build_service(FailedConnection())
 
-    assert service.search_pois("museum", "TestCity") == []
-    assert service.get_weather("TestCity") == []
+    assert service.search_pois("museum", "TestCity").is_error
+    assert service.get_weather("TestCity").is_error

@@ -67,9 +67,11 @@ class TripPlanTaskService:
     async def create_task(self, request: TripPlanRequest) -> TripPlanTaskCreatedResponse:
         now = utc_now()
         task_id = f"tp_{now:%Y%m%d}_{secrets.token_hex(6)}"
-        user_id = None
-        if request.session_id:
-            user_id = await self._db.scalar(select(User.id).where(User.session_token == request.session_id))
+        if not request.session_id:
+            raise HTTPException(status_code=422, detail="创建任务需要有效会话")
+        user_id = await self._db.scalar(select(User.id).where(User.session_token == request.session_id))
+        if user_id is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
 
         settings = get_settings()
         task = TripPlanTask(
@@ -115,17 +117,26 @@ class TripPlanTaskService:
         task.finished_at = now
         await self._db.flush()
 
-    async def get_status(self, task_id: str) -> TripPlanTaskStatusResponse:
-        return self.to_status_response(await self._get_task(task_id))
+    async def get_status(self, task_id: str, session_id: str | None = None) -> TripPlanTaskStatusResponse:
+        return self.to_status_response(await self._get_task(task_id, session_id=session_id))
 
-    async def get_result(self, task_id: str) -> TripPlanResponse | TripPlanTaskPendingResult:
-        task = await self._get_task(task_id)
+    async def get_result(
+        self,
+        task_id: str,
+        session_id: str | None = None,
+    ) -> TripPlanResponse | TripPlanTaskPendingResult:
+        task = await self._get_task(task_id, session_id=session_id)
         if task.status == "succeeded" and task.result_payload:
             return TripPlanResponse.model_validate(task.result_payload)
         return TripPlanTaskPendingResult(status=task.status, message=task.error_message or task.message)
 
-    async def _get_task(self, task_id: str) -> TripPlanTask:
-        task = await self._db.scalar(select(TripPlanTask).where(TripPlanTask.task_id == task_id))
+    async def _get_task(self, task_id: str, session_id: str | None = None) -> TripPlanTask:
+        statement = select(TripPlanTask).where(TripPlanTask.task_id == task_id)
+        if session_id is not None:
+            statement = statement.join(User, TripPlanTask.user_id == User.id).where(
+                User.session_token == session_id
+            )
+        task = await self._db.scalar(statement)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return task
@@ -162,9 +173,116 @@ class TripPlanTaskReader:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
         self._session_factory = session_factory
 
-    async def get_status(self, task_id: str) -> TripPlanTaskStatusResponse:
+    async def get_status(self, task_id: str, session_id: str | None = None) -> TripPlanTaskStatusResponse:
         async with self._session_factory() as db:
-            return await TripPlanTaskService(db).get_status(task_id)
+            return await TripPlanTaskService(db).get_status(task_id, session_id=session_id)
+
+
+async def cleanup_expired_tasks(
+    session_factory: async_sessionmaker[AsyncSession],
+    now: datetime | None = None,
+) -> int:
+    """Mark non-terminal tasks past expires_at as expired."""
+    now = now or utc_now()
+    async with session_factory() as db:
+        tasks = (
+            await db.scalars(
+                select(TripPlanTask)
+                .where(
+                    TripPlanTask.expires_at.is_not(None),
+                    TripPlanTask.expires_at < now,
+                    TripPlanTask.status.not_in(TERMINAL_TASK_STATUSES),
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        for task in tasks:
+            transition_task(
+                task,
+                status="expired",
+                phase="expired",
+                progress=task.progress or 0,
+                message="任务已过期",
+                now=now,
+            )
+            task.finished_at = now
+            task.error_code = "TASK_EXPIRED"
+            task.error_message = "任务结果已超过保留期限"
+        if tasks:
+            await db.commit()
+        return len(tasks)
+
+
+async def recover_stale_queued_tasks(
+    session_factory: async_sessionmaker[AsyncSession],
+    stale_threshold_seconds: int = 300,
+    now: datetime | None = None,
+) -> int:
+    """Fail queued tasks that never started within the recovery threshold."""
+    now = now or utc_now()
+    threshold = now - timedelta(seconds=stale_threshold_seconds)
+    async with session_factory() as db:
+        tasks = (
+            await db.scalars(
+                select(TripPlanTask)
+                .where(
+                    TripPlanTask.status == "queued",
+                    TripPlanTask.queued_at < threshold,
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        for task in tasks:
+            transition_task(
+                task,
+                status="failed",
+                phase="failed",
+                progress=task.progress or 0,
+                message="任务排队超时",
+                now=now,
+            )
+            task.finished_at = now
+            task.error_code = "ENQUEUE_LOST"
+            task.error_message = "任务长时间未开始，可能未成功进入队列，请重新提交"
+        if tasks:
+            await db.commit()
+        return len(tasks)
+
+
+async def recover_stale_running_tasks(
+    session_factory: async_sessionmaker[AsyncSession],
+    stale_threshold_seconds: int,
+    now: datetime | None = None,
+) -> int:
+    """Fail running tasks that stopped reporting progress beyond the worker deadline."""
+    now = now or utc_now()
+    threshold = now - timedelta(seconds=stale_threshold_seconds)
+    async with session_factory() as db:
+        tasks = (
+            await db.scalars(
+                select(TripPlanTask)
+                .where(
+                    TripPlanTask.status == "running",
+                    TripPlanTask.updated_at < threshold,
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        for task in tasks:
+            transition_task(
+                task,
+                status="failed",
+                phase="failed",
+                progress=task.progress or 0,
+                message="任务执行超时",
+                now=now,
+            )
+            task.finished_at = now
+            task.error_code = "WORKER_LOST"
+            task.error_message = "Worker 长时间未上报进度，请重新提交任务"
+        if tasks:
+            await db.commit()
+        return len(tasks)
 
 
 async def update_task_progress(
@@ -205,7 +323,7 @@ async def fail_task(
 
     async with session_factory() as db:
         task = await db.scalar(select(TripPlanTask).where(TripPlanTask.task_id == task_id).with_for_update())
-        if task is None or task.status == "succeeded":
+        if task is None or task.status in TERMINAL_TASK_STATUSES:
             return
         now = utc_now()
         transition_task(

@@ -14,7 +14,7 @@ from hello_agents.tools import MCPTool
 
 from app.config import get_settings
 from app.models.schemas import WeatherInfo
-from app.services.amap_service import AmapService
+from app.services.amap_service import AmapService, ServiceResult
 
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ class _PersistentMCPConnection:
         self._queue: Optional[asyncio.Queue] = None
         self._thread: Optional[threading.Thread] = None
         self._task: Optional[asyncio.Task] = None
+        self._active_call: Optional[asyncio.Task] = None
         self._tools: List[Dict[str, Any]] = []
         self._startup_error: Optional[BaseException] = None
         self._ready = threading.Event()
@@ -107,6 +108,11 @@ class _PersistentMCPConnection:
     @property
     def available_tools(self) -> List[Dict[str, Any]]:
         return list(self._tools)
+
+    @property
+    def is_healthy(self) -> bool:
+        thread_stopped = self._thread is not None and self._stopped.is_set()
+        return not self._closing.is_set() and not thread_stopped
 
     def start(self) -> None:
         with self._start_lock:
@@ -136,10 +142,16 @@ class _PersistentMCPConnection:
         request = _MCPRequest(tool_name=tool_name, arguments=arguments, future=future)
         self._loop.call_soon_threadsafe(self._queue.put_nowait, request)
         try:
-            return future.result(timeout=self._call_timeout)
+            return future.result(timeout=self._call_timeout + 1)
         except FutureTimeoutError as exc:
             future.cancel()
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._cancel_active_call)
             raise TimeoutError(f"AMap MCP tool '{tool_name}' timed out") from exc
+
+    def _cancel_active_call(self) -> None:
+        if self._active_call is not None and not self._active_call.done():
+            self._active_call.cancel()
 
     def close(self) -> None:
         self._closing.set()
@@ -148,9 +160,7 @@ class _PersistentMCPConnection:
             self._stopped.set()
             return
         if self._loop is not None and thread.is_alive():
-            if self._queue is not None:
-                self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
-            elif self._task is not None:
+            if self._task is not None:
                 self._loop.call_soon_threadsafe(self._task.cancel)
         if thread is not threading.current_thread():
             thread.join(timeout=self._call_timeout + 5)
@@ -171,26 +181,62 @@ class _PersistentMCPConnection:
     async def _serve(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.current_task()
-        client_context = self._create_client()
-        async with client_context as client:
-            self._tools = await client.list_tools()
-            self._queue = asyncio.Queue()
-            self._ready.set()
+        self._queue = asyncio.Queue()
+        first_connection = True
 
-            while True:
-                request = await self._queue.get()
-                if request is None:
-                    break
-                if request.future.cancelled():
-                    continue
-                try:
-                    result = await client.call_tool(request.tool_name, request.arguments)
-                except Exception as exc:
-                    if not request.future.cancelled():
-                        request.future.set_exception(exc)
-                else:
-                    if not request.future.cancelled():
-                        request.future.set_result(result)
+        while not self._closing.is_set():
+            reconnect = False
+            client_context = self._create_client()
+            async with client_context as client:
+                self._tools = await client.list_tools()
+                if first_connection:
+                    self._ready.set()
+                    first_connection = False
+
+                while not self._closing.is_set():
+                    request = await self._queue.get()
+                    if request is None:
+                        return
+                    if request.future.cancelled():
+                        continue
+                    try:
+                        self._active_call = asyncio.create_task(
+                            client.call_tool(request.tool_name, request.arguments)
+                        )
+                        result = await asyncio.wait_for(
+                            self._active_call,
+                            timeout=self._call_timeout,
+                        )
+                    except TimeoutError:
+                        logger.warning("AMap MCP tool '%s' timed out; reconnecting", request.tool_name)
+                        if not request.future.cancelled():
+                            request.future.set_exception(
+                                TimeoutError(f"AMap MCP tool '{request.tool_name}' timed out")
+                            )
+                        reconnect = True
+                        break
+                    except asyncio.CancelledError:
+                        if self._closing.is_set():
+                            raise
+                        if not request.future.cancelled():
+                            request.future.set_exception(
+                                RuntimeError("AMap MCP tool call was cancelled")
+                            )
+                        reconnect = True
+                        break
+                    except Exception as exc:
+                        if not request.future.cancelled():
+                            request.future.set_exception(exc)
+                    else:
+                        if not request.future.cancelled():
+                            request.future.set_result(result)
+                    finally:
+                        self._active_call = None
+
+            if reconnect:
+                logger.warning("Rebuilding AMap MCP client after an interrupted tool call")
+                continue
+            break
 
     def _create_client(self):
         if self._client_factory is not None:
@@ -281,9 +327,17 @@ class AmapMCPService(AmapService):
         self._bind_lock = threading.Lock()
         self._bound = False
 
-    def search_pois(self, keywords: str, city: str, offset: int = 10) -> List[Dict]:
+    @property
+    def healthy(self) -> bool:
+        return bool(getattr(self._connection, "is_healthy", True))
+
+    def search_pois(self, keywords: str, city: str, offset: int = 10) -> ServiceResult[Dict]:
         if not self.enabled:
-            return []
+            return ServiceResult(
+                error="AMap API key is not configured",
+                error_kind="configuration",
+                source="amap_mcp",
+            )
         if not self._mcp_enabled:
             return self._fallback_search(keywords, city, offset)
 
@@ -296,24 +350,64 @@ class AmapMCPService(AmapService):
             pois = self._extract_pois(payload)
             normalized = [self._enrich_poi(item) for item in pois[:limit]]
             results = [item for item in normalized if item]
-            return results or self._fallback_search(keywords, city, limit)
+            if results:
+                return ServiceResult(data=results, source="amap_mcp")
+            fallback = self._fallback_search(keywords, city, limit)
+            if fallback.data or fallback.is_error:
+                fallback.fallback_from = "amap_mcp_empty"
+                return fallback
+            return ServiceResult(source="amap_mcp")
         except Exception as exc:
             logger.warning("AMap MCP POI search failed; using fallback: %s", exc)
-            return self._fallback_search(keywords, city, limit)
+            fallback = self._fallback_search(keywords, city, limit)
+            if fallback.data:
+                fallback.fallback_from = f"amap_mcp: {exc}"
+                return fallback
+            if fallback.is_error:
+                fallback.error = f"AMap MCP failed: {exc}; HTTP fallback failed: {fallback.error}"
+                fallback.fallback_from = "amap_mcp"
+                return fallback
+            return ServiceResult(
+                error=f"AMap MCP failed: {exc}",
+                error_kind=_error_kind(exc),
+                source="amap_mcp",
+            )
 
-    def get_weather(self, city: str) -> List[WeatherInfo]:
+    def get_weather(self, city: str) -> ServiceResult[WeatherInfo]:
         if not self.enabled:
-            return []
+            return ServiceResult(
+                error="AMap API key is not configured",
+                error_kind="configuration",
+                source="amap_mcp",
+            )
         if not self._mcp_enabled:
             return self._fallback_weather(city)
 
         try:
             payload = self._call_mcp(self.WEATHER_TOOL_NAMES, {"city": city})
             weather = [self._weather_from_cast(item) for item in self._extract_weather_casts(payload)]
-            return weather or self._fallback_weather(city)
+            if weather:
+                return ServiceResult(data=weather, source="amap_mcp")
+            fallback = self._fallback_weather(city)
+            if fallback.data or fallback.is_error:
+                fallback.fallback_from = "amap_mcp_empty"
+                return fallback
+            return ServiceResult(source="amap_mcp")
         except Exception as exc:
             logger.warning("AMap MCP weather query failed; using fallback: %s", exc)
-            return self._fallback_weather(city)
+            fallback = self._fallback_weather(city)
+            if fallback.data:
+                fallback.fallback_from = f"amap_mcp: {exc}"
+                return fallback
+            if fallback.is_error:
+                fallback.error = f"AMap MCP failed: {exc}; HTTP fallback failed: {fallback.error}"
+                fallback.fallback_from = "amap_mcp"
+                return fallback
+            return ServiceResult(
+                error=f"AMap MCP failed: {exc}",
+                error_kind=_error_kind(exc),
+                source="amap_mcp",
+            )
 
     def close(self) -> None:
         self._connection.close()
@@ -390,15 +484,19 @@ class AmapMCPService(AmapService):
             normalized["biz_ext"] = {"rating": normalized["rating"]}
         return normalized
 
-    def _fallback_search(self, keywords: str, city: str, offset: int) -> List[Dict]:
+    def _fallback_search(self, keywords: str, city: str, offset: int) -> ServiceResult[Dict]:
         if not self._http_fallback:
-            return []
-        return super().search_pois(keywords, city, offset)
+            return ServiceResult(source="amap_mcp")
+        result = super().search_pois(keywords, city, offset)
+        result.source = "amap_http_fallback"
+        return result
 
-    def _fallback_weather(self, city: str) -> List[WeatherInfo]:
+    def _fallback_weather(self, city: str) -> ServiceResult[WeatherInfo]:
         if not self._http_fallback:
-            return []
-        return super().get_weather(city)
+            return ServiceResult(source="amap_mcp")
+        result = super().get_weather(city)
+        result.source = "amap_http_fallback"
+        return result
 
     @classmethod
     def _extract_pois(cls, payload: Any) -> List[Dict[str, Any]]:
@@ -482,6 +580,14 @@ def _first_value(value: Any, default: Any) -> Any:
     return default if value in (None, "") else value
 
 
+def _error_kind(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, ConnectionError):
+        return "connection"
+    return "unexpected"
+
+
 def _normalize_server_command(server_command: List[str]) -> List[str]:
     if not server_command:
         raise ValueError("AMap MCP server command cannot be empty")
@@ -500,9 +606,10 @@ _shared_service_lock = threading.Lock()
 
 def get_amap_mcp_service() -> AmapMCPService:
     global _shared_service
-    if _shared_service is None:
+    if _shared_service is None or not _shared_service.healthy:
         with _shared_service_lock:
-            if _shared_service is None:
+            if _shared_service is None or not _shared_service.healthy:
+                stale_service = _shared_service
                 settings = get_settings()
                 _shared_service = AmapMCPService(
                     api_key=settings.amap_api_key,
@@ -512,6 +619,8 @@ def get_amap_mcp_service() -> AmapMCPService:
                     startup_timeout=settings.amap_mcp_startup_timeout_seconds,
                     call_timeout=settings.amap_mcp_call_timeout_seconds,
                 )
+                if stale_service is not None:
+                    stale_service.close()
     return _shared_service
 
 

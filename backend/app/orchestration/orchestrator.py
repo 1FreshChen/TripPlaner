@@ -106,6 +106,7 @@ class AgentOrchestrator:
             result.status = AgentStatus.COMPLETED
             result.output = fallback_output
             result.fallback_used = self._fallback_chain.last_level_used
+            result.error_message = str(last_error) if last_error else None
             self._clear_agent_failure_flags(context, agent_name, clear_candidate_metadata=True)
         else:
             result.status = AgentStatus.FAILED

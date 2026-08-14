@@ -137,16 +137,32 @@ class LLMService:
                     }
                 )
                 parsed_calls: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
+                parse_errors: Dict[str, str] = {}
                 for tool_call in tool_calls:
                     tool_name = tool_call.get("function", {}).get("name", "")
-                    arguments = json.loads(tool_call.get("function", {}).get("arguments") or "{}")
-                    tool_calls_log.append(
-                        {
-                            "tool": tool_name,
-                            "arguments": arguments,
-                            "id": tool_call.get("id"),
-                        }
-                    )
+                    tool_call_id = str(tool_call.get("id") or "")
+                    raw_arguments = tool_call.get("function", {}).get("arguments") or "{}"
+                    try:
+                        arguments = json.loads(raw_arguments)
+                        if not isinstance(arguments, dict):
+                            raise TypeError("tool arguments must decode to a JSON object")
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        parse_error = f"Malformed tool arguments: {exc}"
+                        logger.warning(
+                            "LLM returned malformed tool arguments for '%s': %s",
+                            tool_name,
+                            str(raw_arguments)[:200],
+                        )
+                        arguments = {}
+                        parse_errors[tool_call_id] = parse_error
+                    log_entry = {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "id": tool_call.get("id"),
+                    }
+                    if tool_call_id in parse_errors:
+                        log_entry["error"] = parse_errors[tool_call_id]
+                    tool_calls_log.append(log_entry)
                     parsed_calls.append((tool_call, tool_name, arguments))
 
                 if tool_rounds >= max_tool_rounds:
@@ -163,11 +179,15 @@ class LLMService:
                     )
 
                 for tool_call, tool_name, arguments in parsed_calls:
-                    try:
-                        result = await tool_executor.execute_by_name(tool_name, **arguments)
-                    except Exception as exc:
-                        logger.warning("Tool execution failed for '%s': %s", tool_name, exc)
-                        result = {"success": False, "tool": tool_name, "error": str(exc)}
+                    parse_error = parse_errors.get(str(tool_call.get("id") or ""))
+                    if parse_error:
+                        result = {"success": False, "tool": tool_name, "error": parse_error}
+                    else:
+                        try:
+                            result = await tool_executor.execute_by_name(tool_name, **arguments)
+                        except Exception as exc:
+                            logger.warning("Tool execution failed for '%s': %s", tool_name, exc)
+                            result = {"success": False, "tool": tool_name, "error": str(exc)}
                     messages.append(
                         {
                             "role": "tool",

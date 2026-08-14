@@ -26,7 +26,7 @@ export function useExport() {
     exporting.value = true
     try {
       await nextTick()
-      const [{ default: html2canvas }, { default: jsPDF }] = await Promise.all([
+      const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
         import('html2canvas'),
         import('jspdf')
       ])

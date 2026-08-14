@@ -14,11 +14,11 @@
 
 ## 需要你填写的 Key
 
-复制根目录 `.env.example` 到后端和前端对应位置：
+分别复制后端和前端环境变量模板：
 
 ```bash
 copy .env.example backend\.env
-copy .env.example frontend\.env
+copy frontend\.env.example frontend\.env
 ```
 
 需要填写：
@@ -52,7 +52,7 @@ uvicorn app.api.main:app --reload
 ```bash
 cd frontend
 npm install
-copy ..\.env.example .env
+copy .env.example .env
 npm run dev
 ```
 

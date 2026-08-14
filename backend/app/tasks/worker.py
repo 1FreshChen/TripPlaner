@@ -12,7 +12,13 @@ from app.models.db_models import TripPlanTask
 from app.models.schemas import TripPlanRequest
 from app.services.amap_mcp_service import close_amap_mcp_service
 from app.services.state_service import StateService
-from app.services.task_service import fail_task, transition_task, update_task_progress, utc_now
+from app.services.task_service import (
+    TERMINAL_TASK_STATUSES,
+    fail_task,
+    transition_task,
+    update_task_progress,
+    utc_now,
+)
 from app.tasks.queue import redis_settings_from_url
 
 
@@ -20,7 +26,7 @@ async def generate_trip_plan_task(ctx: dict, task_id: str) -> str | None:
     session_factory = get_session_factory()
     async with session_factory() as lookup_db:
         task = await lookup_db.scalar(select(TripPlanTask).where(TripPlanTask.task_id == task_id))
-        if task is None or task.status in {"succeeded", "cancelled", "expired"}:
+        if task is None or task.status in {"succeeded", "failed", "cancelled", "expired"}:
             return None
         request_payload = dict(task.request_payload)
 
@@ -36,6 +42,9 @@ async def generate_trip_plan_task(ctx: dict, task_id: str) -> str | None:
             task = await db.scalar(select(TripPlanTask).where(TripPlanTask.task_id == task_id).with_for_update())
             if task is None:
                 raise RuntimeError(f"Task {task_id} disappeared before completion")
+            if task.status in TERMINAL_TASK_STATUSES:
+                await db.rollback()
+                return None
             now = utc_now()
             transition_task(
                 task,
@@ -52,6 +61,13 @@ async def generate_trip_plan_task(ctx: dict, task_id: str) -> str | None:
             task.error_message = None
             await db.commit()
             return result.plan_id
+        except asyncio.CancelledError:
+            await db.rollback()
+            try:
+                await fail_task(session_factory, task_id, RuntimeError("Worker stopped before task completion"))
+            except Exception:
+                pass
+            raise
         except Exception as exc:
             await db.rollback()
             await fail_task(session_factory, task_id, exc)
