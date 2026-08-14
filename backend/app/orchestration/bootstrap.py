@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.agents.llm_planner import LLMPlannerAgent
+from app.agents.pydantic_planner import PydanticAIPlannerAgent
 from app.agents.trip_planner import AttractionSearchAgent, HotelAgent, PlannerAgent, WeatherQueryAgent
 from app.config import get_settings
 from app.orchestration.base import AgentDefinition, FallbackLevel, RetryPolicy
@@ -27,6 +28,7 @@ def bootstrap_orchestration(
     max_refinement_rounds: int | None = None,
     min_pass_score: float | None = None,
     baidu_service: BaiduMapService | None = None,
+    enable_pydantic_ai_planner: bool | None = None,
 ) -> AgentRegistry:
     settings = get_settings()
     use_external = settings.enable_external_services if enable_external_services is None else enable_external_services
@@ -34,6 +36,11 @@ def bootstrap_orchestration(
         settings.enable_llm_tool_planning if enable_llm_tool_planning is None else enable_llm_tool_planning
     )
     use_plan_critique = settings.enable_plan_critique if enable_plan_critique is None else enable_plan_critique
+    use_pydantic_planner = (
+        settings.enable_pydantic_ai_planner
+        if enable_pydantic_ai_planner is None
+        else enable_pydantic_ai_planner
+    )
     refinement_rounds = (
         settings.max_refinement_rounds if max_refinement_rounds is None else max_refinement_rounds
     )
@@ -72,14 +79,27 @@ def bootstrap_orchestration(
         )
     )
     if use_tool_planner and use_external and llm.enabled:
-        planner_factory = lambda: LLMPlannerAgent(
-            llm,
-            tools,
-            executor,
-            enable_critique=use_plan_critique,
-            max_refinement_rounds=refinement_rounds,
-            min_pass_score=pass_score,
-        )
+        if use_pydantic_planner:
+            planner_factory = lambda: PydanticAIPlannerAgent(
+                llm,
+                tools,
+                executor,
+                enable_critique=use_plan_critique,
+                max_refinement_rounds=refinement_rounds,
+                min_pass_score=pass_score,
+                request_limit=settings.pydantic_ai_request_limit,
+                tool_call_limit=settings.pydantic_ai_tool_call_limit,
+                tool_round_limit=settings.pydantic_ai_tool_round_limit,
+            )
+        else:
+            planner_factory = lambda: LLMPlannerAgent(
+                llm,
+                tools,
+                executor,
+                enable_critique=use_plan_critique,
+                max_refinement_rounds=refinement_rounds,
+                min_pass_score=pass_score,
+            )
     else:
         planner_factory = lambda: PlannerAgent(
             llm,

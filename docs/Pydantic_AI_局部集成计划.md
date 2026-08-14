@@ -6,7 +6,7 @@
 - 保留现有 orchestrator、搜索 Agent、fallback、API、数据库及领域模型。
 - 新旧 Planner 通过功能开关双轨运行，默认继续使用旧实现。
 - CI 使用完全离线评测；另提供手动真实模型对比评测。
-- 固定使用当前稳定版 `pydantic-ai-slim[openai]==2.30.0` 和 `pydantic-evals==2.30.0`，避免快速更新造成接口漂移。
+- 固定使用当前稳定版 `pydantic-ai-slim==2.30.0` 和 `pydantic-evals==2.30.0`，避免快速更新造成接口漂移。由于项目既有 `hello-agents==0.2.9` 要求 `openai<2`，不安装会引入 `openai>=2.45` 冲突的 `[openai]` extra，改由项目现有 OpenAI-compatible HTTP 通道实现 Pydantic AI Model 适配器。
 
 ## 核心实现
 
