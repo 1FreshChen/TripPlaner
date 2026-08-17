@@ -28,6 +28,20 @@
 
 数据库迁移可能不是可逆的，因此发布迁移必须保持向后兼容；重大迁移前先做备份。
 
+### LangGraph 状态机灰度启用
+
+新编排默认保持 `ORCHESTRATION_BACKEND=legacy`。启用前先部署代码并执行 Alembic `003_langgraph_state_machine`，确认 API 与 Worker 使用同一套版本配置，再同时设置：
+
+```dotenv
+ORCHESTRATION_BACKEND=langgraph
+LANGGRAPH_WORKFLOW_VERSION=trip_planning_v1
+LANGGRAPH_STATE_SCHEMA_VERSION=1
+```
+
+`LANGGRAPH_CHECKPOINT_DSN` 可留空，Worker 会从 `DATABASE_URL` 派生 psycopg DSN。切回 legacy 只影响新建任务；已经按 langgraph 创建的非终态任务仍需由带 checkpoint runtime 的 Worker 排空后再下线，避免版本快照与执行器不一致。
+
+上线检查应覆盖 Worker 日志中的 checkpoint 初始化、独立 heartbeat、恢复 scanner，以及 `trip_plan_tasks` 的 `heartbeat_at/recovery_state/retry_count`。先用单 Worker 小流量验证，再逐步扩大；迁移本身保持 legacy 代码可读，因此配置回退不要求回滚数据库约束。
+
 ## GitHub 配置
 
 在仓库 Settings → Environments 新建 `production`，建议启用审批和 `main` 分支限制。

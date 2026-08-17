@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -21,6 +22,19 @@ from app.models.schemas import (
 
 
 TERMINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
+PHASE_RANK = {
+    "queued": 0,
+    "preparing": 1,
+    "collecting_context": 2,
+    "llm_planning": 3,
+    "meal_enrichment": 4,
+    "validating": 5,
+    "saving": 6,
+    "completed": 7,
+    "failed": 7,
+    "cancelled": 7,
+    "expired": 7,
+}
 
 
 def utc_now() -> datetime:
@@ -43,6 +57,10 @@ def transition_task(
     now: datetime | None = None,
 ) -> None:
     now = now or utc_now()
+    current_phase = task.phase or "queued"
+    if PHASE_RANK.get(phase, 0) < PHASE_RANK.get(current_phase, 0):
+        phase = current_phase
+        message = task.message
     timings = dict(task.phase_timings or {})
     if task.phase_started_at and task.phase and task.phase != phase:
         timings[task.phase] = _elapsed_ms(task.phase_started_at, now)
@@ -87,6 +105,14 @@ class TripPlanTaskService:
             phase_started_at=now,
             updated_at=now,
             expires_at=now + timedelta(days=settings.task_result_ttl_days),
+            orchestration_backend=settings.orchestration_backend,
+            workflow_version=(
+                settings.langgraph_workflow_version
+                if settings.orchestration_backend == "langgraph"
+                else "legacy_v1"
+            ),
+            state_schema_version=settings.langgraph_state_schema_version,
+            recovery_state="none",
         )
         self._db.add(task)
         await self._db.flush()
@@ -192,6 +218,7 @@ async def cleanup_expired_tasks(
                     TripPlanTask.expires_at.is_not(None),
                     TripPlanTask.expires_at < now,
                     TripPlanTask.status.not_in(TERMINAL_TASK_STATUSES),
+                    TripPlanTask.orchestration_backend == "legacy",
                 )
                 .with_for_update(skip_locked=True)
             )
@@ -211,6 +238,61 @@ async def cleanup_expired_tasks(
         if tasks:
             await db.commit()
         return len(tasks)
+
+
+async def expire_langgraph_tasks(
+    session_factory: async_sessionmaker[AsyncSession],
+    now: datetime | None = None,
+) -> list[str]:
+    """Expire due LangGraph tasks and claim checkpoint threads that still need deletion."""
+    now = now or utc_now()
+    async with session_factory() as db:
+        tasks = (
+            await db.scalars(
+                select(TripPlanTask)
+                .where(
+                    TripPlanTask.expires_at.is_not(None),
+                    TripPlanTask.expires_at < now,
+                    TripPlanTask.orchestration_backend == "langgraph",
+                    TripPlanTask.checkpoint_deleted_at.is_(None),
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        for task in tasks:
+            if task.status not in TERMINAL_TASK_STATUSES:
+                transition_task(
+                    task,
+                    status="expired",
+                    phase="expired",
+                    progress=task.progress or 0,
+                    message="任务已过期",
+                    now=now,
+                )
+                task.finished_at = now
+                task.error_code = "TASK_EXPIRED"
+                task.error_message = "任务结果已超过保留期限"
+                task.lease_owner = None
+                task.recovery_state = "none"
+        if tasks:
+            await db.commit()
+        return [task.task_id for task in tasks]
+
+
+async def mark_checkpoint_deleted(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: str,
+) -> None:
+    async with session_factory() as db:
+        await db.execute(
+            update(TripPlanTask)
+            .where(
+                TripPlanTask.task_id == task_id,
+                TripPlanTask.checkpoint_deleted_at.is_(None),
+            )
+            .values(checkpoint_deleted_at=utc_now())
+        )
+        await db.commit()
 
 
 async def recover_stale_queued_tasks(
@@ -264,6 +346,7 @@ async def recover_stale_running_tasks(
                 .where(
                     TripPlanTask.status == "running",
                     TripPlanTask.updated_at < threshold,
+                    TripPlanTask.orchestration_backend == "legacy",
                 )
                 .with_for_update(skip_locked=True)
             )
@@ -291,9 +374,13 @@ async def update_task_progress(
     phase: str,
     progress: int,
     message: str,
+    lease_owner: str | None = None,
 ) -> None:
     async with session_factory() as db:
-        task = await db.scalar(select(TripPlanTask).where(TripPlanTask.task_id == task_id).with_for_update())
+        statement = select(TripPlanTask).where(TripPlanTask.task_id == task_id)
+        if lease_owner is not None:
+            statement = statement.where(TripPlanTask.lease_owner == lease_owner)
+        task = await db.scalar(statement.with_for_update())
         if task is None or task.status in TERMINAL_TASK_STATUSES:
             return
         transition_task(
@@ -302,6 +389,217 @@ async def update_task_progress(
             phase=phase,
             progress=progress,
             message=message,
+        )
+        await db.commit()
+
+
+def progress_from_graph_state(state: dict[str, Any]) -> tuple[str, int, str]:
+    """Derive a monotonic public projection from durable graph values."""
+    collectors = sum(
+        key in state
+        for key in ("attraction_search", "weather_query", "hotel_recommendation")
+    )
+    phase = "collecting_context"
+    progress = 10 + (25 * collectors // 3)
+    message = f"已完成信息采集 {collectors}/3"
+    if "trip_planner" in state:
+        phase, progress, message = "llm_planning", 75, "每日行程已生成"
+    if "meal_enriched" in state:
+        phase, progress, message = "meal_enrichment", 90, "餐饮信息处理完成"
+    if state.get("validation_passed") or (
+        isinstance(state.get("terminal_error"), dict)
+        and state["terminal_error"].get("node") == "validate"
+    ):
+        phase, progress, message = "validating", 95, "行程质量校验完成"
+    return phase, progress, message
+
+
+async def reconcile_task_progress(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: str,
+    state: dict[str, Any],
+    *,
+    lease_owner: str,
+) -> None:
+    phase, progress, message = progress_from_graph_state(state)
+    await update_task_progress(
+        session_factory,
+        task_id,
+        phase,
+        progress,
+        message,
+        lease_owner=lease_owner,
+    )
+
+
+async def acquire_task_lease(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: str,
+    lease_owner: str,
+) -> dict[str, Any] | None:
+    async with session_factory() as db:
+        task = await db.scalar(
+            select(TripPlanTask).where(TripPlanTask.task_id == task_id).with_for_update()
+        )
+        if task is None or task.status in TERMINAL_TASK_STATUSES:
+            return None
+        now = utc_now()
+        transition_task(
+            task,
+            status="running",
+            phase=task.phase if task.phase != "queued" else "preparing",
+            progress=max(task.progress or 0, 5),
+            message="正在准备行程请求" if task.phase == "queued" else task.message,
+            now=now,
+        )
+        task.heartbeat_at = now
+        task.lease_owner = lease_owner
+        task.recovery_state = "none"
+        task.recovery_enqueued_at = None
+        await db.commit()
+        return {
+            "request_payload": dict(task.request_payload),
+            "result_plan_id": str(task.result_plan_id) if task.result_plan_id else None,
+            "workflow_version": task.workflow_version,
+            "state_schema_version": task.state_schema_version,
+        }
+
+
+async def refresh_task_heartbeat(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: str,
+    lease_owner: str,
+) -> bool:
+    now = utc_now()
+    async with session_factory() as db:
+        result = await db.execute(
+            update(TripPlanTask)
+            .where(
+                TripPlanTask.task_id == task_id,
+                TripPlanTask.lease_owner == lease_owner,
+                TripPlanTask.status == "running",
+            )
+            .values(heartbeat_at=now)
+        )
+        await db.commit()
+        return bool(result.rowcount)
+
+
+async def mark_task_recovery_pending(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: str,
+    lease_owner: str,
+) -> None:
+    async with session_factory() as db:
+        await db.execute(
+            update(TripPlanTask)
+            .where(
+                TripPlanTask.task_id == task_id,
+                TripPlanTask.lease_owner == lease_owner,
+                TripPlanTask.status == "running",
+            )
+            .values(
+                lease_owner=None,
+                recovery_state="pending",
+                recovery_enqueued_at=utc_now(),
+            )
+        )
+        await db.commit()
+
+
+@dataclass(frozen=True)
+class RecoveryCandidate:
+    task_id: str
+    retry_count: int
+    plan_id: str | None
+    exhausted: bool = False
+
+
+async def claim_recovery_candidates(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    stale_threshold_seconds: int,
+    queue_stale_seconds: int,
+    max_recoveries: int,
+    workflow_version: str,
+    state_schema_version: int,
+    now: datetime | None = None,
+) -> list[RecoveryCandidate]:
+    now = now or utc_now()
+    heartbeat_threshold = now - timedelta(seconds=stale_threshold_seconds)
+    queue_threshold = now - timedelta(seconds=queue_stale_seconds)
+    async with session_factory() as db:
+        tasks = (
+            await db.scalars(
+                select(TripPlanTask)
+                .where(
+                    TripPlanTask.status == "running",
+                    TripPlanTask.orchestration_backend == "langgraph",
+                    or_(
+                        and_(
+                            TripPlanTask.recovery_state == "none",
+                            or_(
+                                TripPlanTask.heartbeat_at.is_(None),
+                                TripPlanTask.heartbeat_at < heartbeat_threshold,
+                            ),
+                        ),
+                        TripPlanTask.recovery_state == "pending",
+                        and_(
+                            TripPlanTask.recovery_state == "queued",
+                            TripPlanTask.recovery_enqueued_at < queue_threshold,
+                        ),
+                    ),
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        candidates: list[RecoveryCandidate] = []
+        for task in tasks:
+            compatible = (
+                task.workflow_version == workflow_version
+                and task.state_schema_version == state_schema_version
+            )
+            if not compatible or task.retry_count >= max_recoveries:
+                candidates.append(
+                    RecoveryCandidate(
+                        task_id=task.task_id,
+                        retry_count=task.retry_count,
+                        plan_id=str(task.result_plan_id) if task.result_plan_id else None,
+                        exhausted=True,
+                    )
+                )
+                continue
+            task.retry_count += 1
+            task.recovery_state = "queued"
+            task.recovery_enqueued_at = now
+            task.lease_owner = None
+            candidates.append(
+                RecoveryCandidate(
+                    task_id=task.task_id,
+                    retry_count=task.retry_count,
+                    plan_id=str(task.result_plan_id) if task.result_plan_id else None,
+                )
+            )
+        if tasks:
+            await db.commit()
+        return candidates
+
+
+async def mark_recovery_enqueue_failed(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: str,
+    retry_count: int,
+) -> None:
+    async with session_factory() as db:
+        await db.execute(
+            update(TripPlanTask)
+            .where(
+                TripPlanTask.task_id == task_id,
+                TripPlanTask.status == "running",
+                TripPlanTask.retry_count == retry_count,
+                TripPlanTask.recovery_state == "queued",
+            )
+            .values(recovery_state="pending", recovery_enqueued_at=utc_now())
         )
         await db.commit()
 

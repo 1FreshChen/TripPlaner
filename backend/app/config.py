@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +59,39 @@ class Settings(BaseSettings):
         default=300,
         ge=60,
         alias="TASK_STALE_QUEUED_SECONDS",
+    )
+    orchestration_backend: Literal["legacy", "langgraph"] = Field(
+        default="legacy",
+        alias="ORCHESTRATION_BACKEND",
+    )
+    langgraph_checkpoint_dsn: str | None = Field(default=None, alias="LANGGRAPH_CHECKPOINT_DSN")
+    langgraph_workflow_version: str = Field(
+        default="trip_planning_v1",
+        min_length=1,
+        alias="LANGGRAPH_WORKFLOW_VERSION",
+    )
+    langgraph_state_schema_version: int = Field(
+        default=1,
+        ge=1,
+        alias="LANGGRAPH_STATE_SCHEMA_VERSION",
+    )
+    langgraph_heartbeat_seconds: int = Field(default=20, ge=5, alias="LANGGRAPH_HEARTBEAT_SECONDS")
+    langgraph_stale_seconds: int = Field(default=90, ge=15, alias="LANGGRAPH_STALE_SECONDS")
+    langgraph_recovery_scan_seconds: int = Field(
+        default=30,
+        ge=5,
+        alias="LANGGRAPH_RECOVERY_SCAN_SECONDS",
+    )
+    langgraph_recovery_queue_stale_seconds: int = Field(
+        default=180,
+        ge=30,
+        alias="LANGGRAPH_RECOVERY_QUEUE_STALE_SECONDS",
+    )
+    langgraph_max_recoveries: int = Field(default=3, ge=0, alias="LANGGRAPH_MAX_RECOVERIES")
+    langgraph_meal_timeout_seconds: int = Field(
+        default=60,
+        ge=1,
+        alias="LANGGRAPH_MEAL_TIMEOUT_SECONDS",
     )
     encryption_key: str = Field(default="", alias="ENCRYPTION_KEY")
     max_conversation_messages: int = Field(default=20, alias="MAX_CONVERSATION_MESSAGES")

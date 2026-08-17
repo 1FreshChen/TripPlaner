@@ -129,7 +129,7 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
         for constraint in trip_plans.constraints
         if constraint.__class__.__name__ == "CheckConstraint"
     )
-    for status in ("draft", "generating", "completed", "editing", "archived"):
+    for status in ("draft", "generating", "completed", "editing", "archived", "failed"):
         assert status in status_constraints
     assert "idx_trip_plans_session_id" in {index.name for index in trip_plans.indexes}
 
@@ -143,6 +143,20 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
     event_log = tables["audit.event_log"]
     assert event_log.schema == "audit"
     assert "idx_audit_event_type" in {index.name for index in event_log.indexes}
+
+    tasks = tables["trip_plan_tasks"]
+    for column in (
+        "heartbeat_at",
+        "lease_owner",
+        "orchestration_backend",
+        "workflow_version",
+        "state_schema_version",
+        "recovery_state",
+        "recovery_enqueued_at",
+        "checkpoint_deleted_at",
+    ):
+        assert column in tasks.columns
+    assert "idx_trip_plan_tasks_recovery" in {index.name for index in tasks.indexes}
 
 
 def test_initial_alembic_migration_contains_required_schema_objects():

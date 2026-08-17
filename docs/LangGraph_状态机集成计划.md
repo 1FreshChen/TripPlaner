@@ -347,6 +347,7 @@ checkpoint 含请求、偏好、工具结果和计划，属于用户数据：
 - `state_schema_version`
 - `recovery_state`：内部状态，取值 `none/pending/queued`，不加入 TaskPhase API 枚举。
 - `recovery_enqueued_at`：用于判断 recovery Job 是否长期未启动。
+- `checkpoint_deleted_at`：记录 TTL 清理已完成，避免 scanner 每轮重复删除同一 checkpoint；删除失败时保持为空以便重试。
 
 Worker 在成功写入本次 `lease_owner` 后启动独立后台协程（`asyncio.create_task`），持锁期间每 15–30 秒更新 heartbeat。具体约束：
 
@@ -461,7 +462,7 @@ Worker 入口使用 `pg_try_advisory_lock` 或等价 lease：
 
 - `backend/requirements.txt`：锁定依赖。
 - `backend/app/config.py` 和 env 示例：新增配置。
-- `backend/app/models/db_models.py`：任务 backend/version/heartbeat/lease/recovery 字段，并允许 TripPlan 的 failed 状态。
+- `backend/app/models/db_models.py`：任务 backend/version/heartbeat/lease/recovery/checkpoint-cleanup 字段，并允许 TripPlan 的 failed 状态。
 - 新 Alembic migration：新增任务字段、`recovery_state` 约束、stale 查询组合索引，并重建 `ck_trip_plans_status` 纳入 failed。
 - `backend/app/services/state_service.py`：拆 prepare/finalize/fail；新增公开状态白名单、`_get_public_plan()` 与受 task/lease 约束的内部工作流查询；保留 task_id 可选的同步兼容入口。
 - `backend/app/orchestration/bootstrap.py`：增加独立 graph factory；不要让同一函数返回不稳定的 union 类型。

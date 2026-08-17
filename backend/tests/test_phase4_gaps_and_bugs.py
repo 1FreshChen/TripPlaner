@@ -715,7 +715,7 @@ def test_update_trip_plan_rejects_stale_expected_version(monkeypatch):
         assert for_update is True
         return current_plan
 
-    monkeypatch.setattr(service, "_get_plan", fake_get_plan)
+    monkeypatch.setattr(service, "_get_public_plan", fake_get_plan)
     update = TripPlanUpdateRequest(
         plan_json=_conversation_trip_plan("stale edit"),
         expected_version=1,
@@ -750,3 +750,5 @@ def test_get_plan_scopes_query_to_session_owner():
 
     assert exc.value.status_code == 404
     assert "trip_plans.session_id" in captured["statement"]
+    assert "trip_plans.status IN" in captured["statement"]
+    assert "archived" not in captured["statement"]

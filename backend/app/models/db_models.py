@@ -51,9 +51,23 @@ class TripPlanTask(Base):
             name="ck_trip_plan_tasks_status",
         ),
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_trip_plan_tasks_progress"),
+        CheckConstraint(
+            "orchestration_backend IN ('legacy','langgraph')",
+            name="ck_trip_plan_tasks_backend",
+        ),
+        CheckConstraint(
+            "recovery_state IN ('none','pending','queued')",
+            name="ck_trip_plan_tasks_recovery_state",
+        ),
         Index("idx_trip_plan_tasks_user_id", "user_id"),
         Index("idx_trip_plan_tasks_status", "status"),
         Index("idx_trip_plan_tasks_updated", "updated_at"),
+        Index(
+            "idx_trip_plan_tasks_recovery",
+            "status",
+            "orchestration_backend",
+            "heartbeat_at",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
@@ -78,6 +92,29 @@ class TripPlanTask(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    orchestration_backend: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="legacy",
+        server_default=text("'legacy'"),
+    )
+    workflow_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="legacy_v1",
+        server_default=text("'legacy_v1'"),
+    )
+    state_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    recovery_state: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="none",
+        server_default=text("'none'"),
+    )
+    recovery_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checkpoint_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     phase_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -95,7 +132,7 @@ class TripPlan(Base):
     __tablename__ = "trip_plans"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('draft','generating','completed','editing','archived')",
+            "status IN ('draft','generating','completed','editing','archived','failed')",
             name="ck_trip_plans_status",
         ),
         Index("idx_trip_plans_user_id", "user_id"),

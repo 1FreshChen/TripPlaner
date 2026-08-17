@@ -320,6 +320,7 @@ def test_state_service_create_trip_plan_uses_memory_recall_and_updates_preferenc
     class FakeDB:
         def __init__(self):
             self.added = []
+            self.commits = 0
 
         def add(self, value):
             self.added.append(value)
@@ -328,7 +329,18 @@ def test_state_service_create_trip_plan_uses_memory_recall_and_updates_preferenc
             return None
 
         async def scalar(self, statement):
+            statement_text = str(statement)
+            if "FROM trip_plans" in statement_text:
+                return next(item for item in self.added if isinstance(item, state_service.TripPlanModel))
+            if "FROM trip_plan_versions" in statement_text:
+                return None
             return SimpleNamespace(id=user_id, session_token=str(session_id))
+
+        async def commit(self):
+            self.commits += 1
+
+        async def rollback(self):
+            return None
 
     monkeypatch.setattr(state_service, "LongTermMemory", FakeLongTermMemory, raising=False)
     monkeypatch.setattr(state_service, "MemoryRecall", FakeMemoryRecall, raising=False)

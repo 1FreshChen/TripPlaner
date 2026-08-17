@@ -50,19 +50,19 @@ async def _maintain_tasks() -> None:
                 session_factory,
                 stale_threshold_seconds=settings.task_stale_queued_seconds,
             )
-            running_recovered = await recover_stale_running_tasks(
+            legacy_running_failed = await recover_stale_running_tasks(
                 session_factory,
                 stale_threshold_seconds=(
                     settings.task_worker_timeout_seconds
                     + settings.task_maintenance_interval_seconds
                 ),
             )
-            if expired or recovered or running_recovered:
+            if expired or recovered or legacy_running_failed:
                 logger.warning(
-                    "Task maintenance updated stale records: expired=%d enqueue_lost=%d worker_lost=%d",
+                    "Task maintenance updated stale records: expired=%d enqueue_lost=%d legacy_worker_lost=%d",
                     expired,
                     recovered,
-                    running_recovered,
+                    legacy_running_failed,
                 )
         except asyncio.CancelledError:
             raise
