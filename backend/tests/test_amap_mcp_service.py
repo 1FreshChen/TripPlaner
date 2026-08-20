@@ -7,6 +7,7 @@ import pytest
 from hello_agents.tools import MCPTool
 
 from app.agents.trip_planner import TripPlannerAgent
+from app.config import get_settings
 from app.services import amap_mcp_service
 from app.services.amap_mcp_service import AmapMCPService, _PersistentMCPConnection
 from app.tools.bootstrap import bootstrap_tools
@@ -298,3 +299,109 @@ def test_mcp_failure_returns_empty_when_http_fallback_is_disabled():
 
     assert service.search_pois("museum", "TestCity").is_error
     assert service.get_weather("TestCity").is_error
+
+
+def test_mcp_qps_error_is_retried_once_then_succeeds(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "1")
+    get_settings.cache_clear()
+
+    class FlakyConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            if tool_name == "maps_text_search" and len(self.calls) == 0:
+                self.calls.append((tool_name, arguments))
+                raise RuntimeError("Get poi detail failed: CUQPS_HAS_EXCEEDED_THE_LIMIT")
+            return super().call_tool(tool_name, arguments)
+
+    service = build_service(FlakyConnection())
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert len([call for call in service._connection.calls if call[0] == "maps_text_search"]) == 2
+
+
+def test_mcp_qps_error_exhausts_retries_then_reports_error(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "1")
+    get_settings.cache_clear()
+
+    class QpsConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            self.calls.append((tool_name, arguments))
+            raise RuntimeError("Get poi detail failed: CUQPS_HAS_EXCEEDED_THE_LIMIT")
+
+    service = build_service(QpsConnection())
+
+    result = service.search_pois("museum", "TestCity")
+
+    assert result.is_error
+    assert len(service._connection.calls) == 2
+
+
+def test_mcp_detail_failure_does_not_break_search(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "0")
+    get_settings.cache_clear()
+
+    class DetailFailingConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            self.calls.append((tool_name, arguments))
+            if tool_name == "maps_text_search":
+                return json.dumps(
+                    {
+                        "pois": [
+                            {"id": "poi-1", "name": "No Location A"},
+                            {"id": "poi-2", "name": "No Location B"},
+                        ]
+                    }
+                )
+            if tool_name == "maps_search_detail":
+                raise RuntimeError("Get poi detail failed: CUQPS_HAS_EXCEEDED_THE_LIMIT")
+            return super().call_tool(tool_name, arguments)
+
+    service = build_service(DetailFailingConnection())
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert [poi["name"] for poi in result.data] == ["No Location A", "No Location B"]
+    assert all("location" not in poi for poi in result.data)
+
+
+def test_mcp_enrichment_is_capped_by_config(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "0")
+    monkeypatch.setenv("AMAP_ENRICH_DETAIL_LIMIT", "2")
+    get_settings.cache_clear()
+
+    class CountingConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            self.calls.append((tool_name, arguments))
+            if tool_name == "maps_text_search":
+                return json.dumps(
+                    {
+                        "pois": [
+                            {"id": f"poi-{index}", "name": f"Museum {index}"}
+                            for index in range(1, 5)
+                        ]
+                    }
+                )
+            if tool_name == "maps_search_detail":
+                return json.dumps(
+                    {
+                        "pois": [
+                            {
+                                "id": arguments["id"],
+                                "location": {"lng": 116.397128, "lat": 39.916527},
+                                "type": "museum",
+                            }
+                        ]
+                    }
+                )
+            return super().call_tool(tool_name, arguments)
+
+    service = build_service(CountingConnection())
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert len(result.data) == 4
+    detail_calls = [call for call in service._connection.calls if call[0] == "maps_search_detail"]
+    assert len(detail_calls) == 2

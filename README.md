@@ -91,3 +91,16 @@ Agent-demo/
     ├── API_KEYS.md
     └── PROJECT_STATUS.md
 ```
+
+## 高德地图 QPS 治理
+
+个人 Key 通常只有约 3 QPS 配额，而 MCP 文本搜索会为每个 POI 逐条拉取详情，多节点并行时容易触发 `CUQPS_HAS_EXCEEDED_THE_LIMIT`（错误码 10021）。代码内置了进程级限流与 QPS 错误退避重试：
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `AMAP_QPS_BUDGET` | `2.0` | 进程级每秒允许的高德调用额度；`0` 关闭限流 |
+| `AMAP_QPS_RETRY_ATTEMPTS` | `2` | 遇到 QPS 限流错误时的退避重试次数 |
+| `AMAP_QPS_RETRY_DELAY_SECONDS` | `1.0` | QPS 重试前的等待秒数 |
+| `AMAP_ENRICH_DETAIL_LIMIT` | `3` | 每次 POI 搜索最多拉取的详情条数；`0` 禁用详情富化 |
+
+POI 详情拉取失败不再击穿整次搜索，仅返回未富化的 POI。限流只在单进程内生效，多 Worker 部署时应按 Worker 数相应调低 `AMAP_QPS_BUDGET`。

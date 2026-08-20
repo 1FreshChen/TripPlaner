@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Dict, Generic, List, Literal, Optional, TypeVar
+from typing import Any, Dict, Generic, List, Literal, Optional, TypeVar
 
 import requests
 
+from app.config import get_settings
 from app.models.schemas import Attraction, Hotel, Location, WeatherInfo
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,63 @@ def unwrap_service_result(result: ServiceResult[T] | List[T] | None) -> List[T]:
     raise ExternalServiceError(result.error or "External service failed")
 
 
+def is_qps_limit_error(payload: Any) -> bool:
+    """Detect AMap QPS quota rejections (error 10021) in payloads or raised errors."""
+    text = str(payload or "").lower()
+    return any(token in text for token in ("cuqps", "qps", "10021", "rate limit", "rate_limit"))
+
+
+class AmapRateLimiter:
+    """Process-local token bucket that paces AMap calls under the key's QPS quota.
+
+    Calls reserve ``cost / budget`` seconds of the shared time line, so bursts are
+    spread across workers without any cross-process coordination. A budget of 0
+    disables pacing entirely.
+    """
+
+    def __init__(self, budget: float, clock=time.monotonic, sleeper=time.sleep):
+        self._budget = budget
+        self._clock = clock
+        self._sleeper = sleeper
+        self._lock = threading.Lock()
+        self._next_free_at = 0.0
+
+    @property
+    def budget(self) -> float:
+        return self._budget
+
+    def wait(self, cost: float = 1.0) -> None:
+        if self._budget <= 0 or cost <= 0:
+            return
+        with self._lock:
+            now = self._clock()
+            earliest = self._next_free_at
+            self._next_free_at = max(now, earliest) + cost / self._budget
+        delay = earliest - now
+        if delay > 0:
+            self._sleeper(delay)
+
+
+_rate_limiter: Optional[AmapRateLimiter] = None
+_rate_limiter_lock = threading.Lock()
+
+
+def get_amap_rate_limiter() -> AmapRateLimiter:
+    global _rate_limiter
+    budget = get_settings().amap_qps_budget
+    if _rate_limiter is None or _rate_limiter.budget != budget:
+        with _rate_limiter_lock:
+            if _rate_limiter is None or _rate_limiter.budget != budget:
+                _rate_limiter = AmapRateLimiter(budget)
+    return _rate_limiter
+
+
+def reset_amap_rate_limiter() -> None:
+    global _rate_limiter
+    with _rate_limiter_lock:
+        _rate_limiter = None
+
+
 class AmapService:
     """高德地图 Web 服务封装。
 
@@ -65,6 +125,33 @@ class AmapService:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
+    def _request_json(self, path: str, params: Dict[str, Any]) -> Any:
+        settings = get_settings()
+        last_error: Optional[Exception] = None
+        for attempt in range(settings.amap_qps_retry_attempts + 1):
+            get_amap_rate_limiter().wait()
+            if attempt > 0:
+                time.sleep(settings.amap_qps_retry_delay_seconds)
+            try:
+                response = requests.get(
+                    f"{self.base_url}{path}",
+                    params=params,
+                    timeout=10,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except Exception as exc:
+                last_error = exc
+                break
+            if is_qps_limit_error(payload) and attempt < settings.amap_qps_retry_attempts:
+                last_error = ExternalServiceError(f"AMap QPS limit exceeded: {payload}")
+                logger.warning("Amap QPS limit hit; retrying %s: %s", path, payload)
+                continue
+            return payload
+        if last_error is not None:
+            raise last_error
+        raise ExternalServiceError("AMap request failed")
+
     def search_pois(self, keywords: str, city: str, offset: int = 10) -> ServiceResult[Dict]:
         if not self.enabled:
             return ServiceResult(
@@ -72,9 +159,9 @@ class AmapService:
                 error_kind="configuration",
             )
         try:
-            response = requests.get(
-                f"{self.base_url}/place/text",
-                params={
+            payload = self._request_json(
+                "/place/text",
+                {
                     "keywords": keywords,
                     "city": city,
                     "key": self.api_key,
@@ -82,10 +169,7 @@ class AmapService:
                     "offset": offset,
                     "page": 1,
                 },
-                timeout=10,
             )
-            response.raise_for_status()
-            payload = response.json()
             if payload.get("status") != "1":
                 logger.warning("Amap POI search failed: %s", payload)
                 return ServiceResult(
@@ -113,13 +197,10 @@ class AmapService:
                 error_kind="configuration",
             )
         try:
-            response = requests.get(
-                f"{self.base_url}/weather/weatherInfo",
-                params={"city": city, "key": self.api_key, "extensions": "all", "output": "json"},
-                timeout=10,
+            payload = self._request_json(
+                "/weather/weatherInfo",
+                {"city": city, "key": self.api_key, "extensions": "all", "output": "json"},
             )
-            response.raise_for_status()
-            payload = response.json()
             if payload.get("status") not in (None, "1"):
                 logger.warning("Amap weather query failed: %s", payload)
                 return ServiceResult(

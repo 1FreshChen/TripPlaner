@@ -29,6 +29,14 @@ class Settings(BaseSettings):
         alias="AMAP_MCP_CALL_TIMEOUT_SECONDS",
     )
     amap_mcp_http_fallback: bool = Field(default=True, alias="AMAP_MCP_HTTP_FALLBACK")
+    amap_qps_budget: float = Field(default=2.0, ge=0.0, alias="AMAP_QPS_BUDGET")
+    amap_qps_retry_attempts: int = Field(default=2, ge=0, alias="AMAP_QPS_RETRY_ATTEMPTS")
+    amap_qps_retry_delay_seconds: float = Field(
+        default=1.0,
+        ge=0.0,
+        alias="AMAP_QPS_RETRY_DELAY_SECONDS",
+    )
+    amap_enrich_detail_limit: int = Field(default=3, ge=0, alias="AMAP_ENRICH_DETAIL_LIMIT")
     baidu_map_api_key: str = Field(default="", alias="BAIDU_MAP_API_KEY")
     unsplash_access_key: str = Field(default="", alias="UNSPLASH_ACCESS_KEY")
     enable_external_services: bool = Field(default=True, alias="ENABLE_EXTERNAL_SERVICES")

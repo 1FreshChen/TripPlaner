@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -14,7 +15,12 @@ from hello_agents.tools import MCPTool
 
 from app.config import get_settings
 from app.models.schemas import WeatherInfo
-from app.services.amap_service import AmapService, ServiceResult
+from app.services.amap_service import (
+    AmapService,
+    ServiceResult,
+    get_amap_rate_limiter,
+    is_qps_limit_error,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -346,9 +352,10 @@ class AmapMCPService(AmapService):
             payload = self._call_mcp(
                 self.SEARCH_TOOL_NAMES,
                 {"keywords": keywords, "city": city},
+                cost=3.0,
             )
             pois = self._extract_pois(payload)
-            normalized = [self._enrich_poi(item) for item in pois[:limit]]
+            normalized = self._enrich_pois(pois[:limit])
             results = [item for item in normalized if item]
             if results:
                 return ServiceResult(data=results, source="amap_mcp")
@@ -425,16 +432,32 @@ class AmapMCPService(AmapService):
             )
             self._bound = True
 
-    def _call_mcp(self, aliases: tuple[str, ...], arguments: Dict[str, Any]) -> Any:
-        self._ensure_bound()
-        tool_name = self._resolve_tool_name(aliases)
-        return self.mcp_tool.run(
-            {
-                "action": "call_tool",
-                "tool_name": tool_name,
-                "arguments": arguments,
-            }
-        )
+    def _call_mcp(self, aliases: tuple[str, ...], arguments: Dict[str, Any], cost: float = 1.0) -> Any:
+        settings = get_settings()
+        for attempt in range(settings.amap_qps_retry_attempts + 1):
+            get_amap_rate_limiter().wait(cost)
+            if attempt > 0:
+                time.sleep(settings.amap_qps_retry_delay_seconds)
+            try:
+                self._ensure_bound()
+                tool_name = self._resolve_tool_name(aliases)
+                return self.mcp_tool.run(
+                    {
+                        "action": "call_tool",
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                    }
+                )
+            except LookupError:
+                raise
+            except Exception as exc:
+                if not is_qps_limit_error(exc) or attempt >= settings.amap_qps_retry_attempts:
+                    raise
+                logger.warning(
+                    "AMap MCP QPS limit hit; retrying '%s': %s",
+                    aliases[0],
+                    exc,
+                )
 
     def _resolve_tool_name(self, aliases: tuple[str, ...]) -> str:
         available = {
@@ -450,26 +473,38 @@ class AmapMCPService(AmapService):
                 return name
         raise LookupError(f"AMap MCP server does not provide any of: {', '.join(aliases)}")
 
-    def _enrich_poi(self, poi: Dict[str, Any]) -> Dict[str, Any]:
-        normalized = self._normalize_poi(poi)
-        if self.parse_location(normalized.get("location")) or not normalized.get("id"):
-            return normalized
-
-        try:
-            payload = self._call_mcp(self.DETAIL_TOOL_NAMES, {"id": normalized["id"]})
-            details = self._extract_pois(payload)
-            if details:
-                detail = self._normalize_poi(details[0])
-                normalized.update(
+    def _enrich_pois(self, pois: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized = [self._normalize_poi(poi) for poi in pois]
+        detail_calls = 0
+        detail_limit = get_settings().amap_enrich_detail_limit
+        for poi in normalized:
+            if self.parse_location(poi.get("location")) or not poi.get("id"):
+                continue
+            if detail_limit > 0 and detail_calls >= detail_limit:
+                continue
+            detail_calls += 1
+            detail = self._fetch_poi_detail(poi["id"])
+            if detail:
+                poi.update(
                     {
                         key: value
                         for key, value in detail.items()
                         if value not in (None, "", [])
                     }
                 )
-        except LookupError:
-            return normalized
         return normalized
+
+    def _fetch_poi_detail(self, poi_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            payload = self._call_mcp(self.DETAIL_TOOL_NAMES, {"id": poi_id})
+            details = self._extract_pois(payload)
+            if details:
+                return self._normalize_poi(details[0])
+        except LookupError:
+            logger.debug("AMap MCP detail tool unavailable; skipping detail for %s", poi_id)
+        except Exception as exc:
+            logger.debug("AMap MCP POI detail failed for %s: %s", poi_id, exc)
+        return None
 
     @staticmethod
     def _normalize_poi(poi: Dict[str, Any]) -> Dict[str, Any]:
