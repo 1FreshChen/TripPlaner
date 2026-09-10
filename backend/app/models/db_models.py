@@ -21,7 +21,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
+from pgvector.sqlalchemy import VECTOR
 
+from app.config import VECTOR_MEMORY_DIMENSIONS
 from app.database import Base
 
 
@@ -41,6 +43,7 @@ class User(Base):
     trip_plans: Mapped[list["TripPlan"]] = relationship(back_populates="user")
     preferences: Mapped["UserPreference | None"] = relationship(back_populates="user", uselist=False)
     saved_items: Mapped[list["SavedItem"]] = relationship(back_populates="user")
+    memory_entries: Mapped[list["MemoryEntry"]] = relationship(back_populates="user")
 
 
 class TripPlanTask(Base):
@@ -264,6 +267,51 @@ class SavedItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     user: Mapped[User] = relationship(back_populates="saved_items")
+
+
+class MemoryEntry(Base):
+    __tablename__ = "memory_entries"
+    __table_args__ = (
+        UniqueConstraint("user_id", "source_key", name="uq_memory_entries_user_source"),
+        Index("idx_memory_entries_user_type", "user_id", "memory_type"),
+        Index("idx_memory_entries_user_created", "user_id", "created_at"),
+        Index(
+            "idx_memory_entries_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    memory_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    embedding: Mapped[list[float]] = mapped_column(VECTOR(VECTOR_MEMORY_DIMENSIONS), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(100), nullable=False)
+    access_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    user: Mapped[User] = relationship(back_populates="memory_entries")
 
 
 class AuditEvent(Base):

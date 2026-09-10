@@ -237,6 +237,7 @@ class StateServicePlanningMixin:
             preferences=_split_preferences(request.preferences),
             budget_level=request.budget,
             days=request.days,
+            source_id=plan.id,
         )
         self._add_audit_event(
             event_type="trip_plan_created",

@@ -57,3 +57,29 @@ def test_settings_baidu_map_api_key_can_be_configured(monkeypatch):
     settings = Settings()
 
     assert settings.baidu_map_api_key == "baidu-test-key"
+
+
+def test_vector_memory_defaults_are_safe_and_bounded(monkeypatch):
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.vector_memory_enabled is True
+    assert settings.embedding_model == "text-embedding-3-small"
+    assert settings.embedding_timeout_seconds == 20.0
+    assert settings.vector_memory_top_k == 5
+    assert settings.vector_memory_min_similarity == 0.3
+    assert settings.vector_memory_max_entries_per_user == 1000
+
+
+def test_vector_memory_can_use_separate_embedding_endpoint(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_API_KEY", "embedding-test-key")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://embeddings.example.test/v1")
+    monkeypatch.setenv("VECTOR_MEMORY_TOP_K", "8")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.embedding_api_key == "embedding-test-key"
+    assert settings.embedding_base_url == "https://embeddings.example.test/v1"
+    assert settings.vector_memory_top_k == 8

@@ -43,27 +43,32 @@ class StateServicePreferencesMixin:
         user_id: str,
         request: SavedItemCreateRequest,
     ) -> SavedItemResponse:
-        item = SavedItem(
-            id=uuid.uuid4(),
+        item = await _compat_symbol("LongTermMemory", LongTermMemory)().add_saved_item(
             user_id=_parse_uuid(user_id, "user_id"),
+            db=self._db,
             item_type=request.item_type,
             item_data=request.item_data,
             tags=request.tags,
             note=request.note,
         )
-        self._db.add(item)
-        await self._db.flush()
         return self._saved_item_response(item)
 
     async def delete_saved_item(self, user_id: str, item_id: str) -> None:
+        user_uuid = _parse_uuid(user_id, "user_id")
+        item_uuid = _parse_uuid(item_id, "item_id")
         item = await self._db.scalar(
             select(SavedItem).where(
-                SavedItem.id == _parse_uuid(item_id, "item_id"),
-                SavedItem.user_id == _parse_uuid(user_id, "user_id"),
+                SavedItem.id == item_uuid,
+                SavedItem.user_id == user_uuid,
             )
         )
         if item is None:
             raise HTTPException(status_code=404, detail="收藏项不存在")
+        await _compat_symbol("LongTermMemory", LongTermMemory)().forget_saved_item(
+            user_id=user_uuid,
+            item_id=item_uuid,
+            db=self._db,
+        )
         await self._db.delete(item)
         await self._db.flush()
 
@@ -77,4 +82,3 @@ class StateServicePreferencesMixin:
             note=item.note,
             created_at=_iso(item.created_at),
         )
-

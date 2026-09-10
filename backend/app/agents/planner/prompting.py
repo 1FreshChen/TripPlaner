@@ -118,6 +118,14 @@ def _format_memory_context(memory_context: Dict[str, Any]) -> str:
         ]
         lines.append(f"- 同城收藏景点: {', '.join(names)}")
 
+    semantic_memories = memory_context.get("semantic_memories") or []
+    for item in semantic_memories[:5]:
+        content = str(item.get("content") or "").strip()
+        if content:
+            similarity = item.get("similarity")
+            suffix = f"（相关度 {float(similarity):.2f}）" if similarity is not None else ""
+            lines.append(f"- 语义召回{suffix}: {content[:300]}")
+
     return "\n".join(lines) if lines else "(无)"
 
 

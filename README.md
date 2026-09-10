@@ -1,6 +1,6 @@
 # 智能旅行助手
 
-一个基于 Vue 3、FastAPI、PostgreSQL、Redis/arq、Pydantic AI 与 LangGraph 的多 Agent 旅行规划系统。
+一个基于 Vue 3、FastAPI、PostgreSQL/pgvector、Redis/arq、Pydantic AI 与 LangGraph 的多 Agent 旅行规划系统。
 
 用户输入目的地、日期、偏好、预算、交通和住宿要求后，系统会并行采集景点、天气和酒店信息，由规划 Agent 生成逐日行程，补充餐饮并执行质量校验。生成过程以后台任务运行，前端可查看真实进度；完成后的计划支持手工编辑、自然语言调整、版本回退、历史记录和收藏。
 
@@ -10,8 +10,9 @@
 - 默认 Planner 节点为 `pydantic_ai`；也可选择 `openai_tools` 或纯本地 `deterministic`，外部能力不可用时自动降级为确定性 Planner。
 - `ENABLE_EXTERNAL_SERVICES=true` 时，最终发布的每个景点必须绑定真实高德 POI；高德不可用或无法匹配时任务明确失败，不再把 LLM 景点作为结果发布。
 - 无外部 API Key 时可将 `ENABLE_EXTERNAL_SERVICES=false`，景点、天气、酒店和规划流程使用本地 fallback/mock，仅用于开发和测试。
-- 当前后端全量测试：`205 passed`（2026-08-24）。
-- 当前 API 版本：`0.3.0`。
+- 长期记忆使用 PostgreSQL + pgvector：行程和收藏持久化为用户隔离的向量，下一次规划按语义相关度召回；嵌入端点不可用时自动退回结构化偏好。
+- 当前后端全量测试：`214 passed`（2026-09-10）。
+- 当前 API 版本：`0.4.0`。
 
 ## 主要能力
 
@@ -24,7 +25,7 @@
 - 耐久工作流：LangGraph + PostgreSQL Checkpointer、租约、心跳和恢复扫描。
 - 计划管理：CRUD、乐观锁、版本历史、版本回退和归档。
 - 对话式调整：识别修改意图，通过自然语言更新指定计划并保存新版本。
-- 记忆与个性化：短期会话、长期偏好、历史地点召回。
+- 记忆与个性化：短期会话、结构化长期偏好、pgvector 行程/收藏语义召回。
 - 前端体验：地图、天气、预算、带图片的逐日行程、编辑、导出图片/PDF、历史和对话页。
 - 安全治理：内容过滤、Prompt 注入检测、限流、请求 ID、审计和密钥加密。
 - 生产化：Docker、生产 Compose、CI/CD、Caddy 示例和 PostgreSQL 备份脚本。
@@ -36,7 +37,7 @@ Vue 3 / Pinia
   │
   │ POST /api/trip/plan → 202 + task_id
   ▼
-FastAPI ── PostgreSQL（会话、计划、版本、任务、记忆、审计）
+FastAPI ── PostgreSQL + pgvector（会话、计划、版本、任务、向量记忆、审计）
   │
   └── Redis / arq ── Worker
                        │
@@ -61,7 +62,7 @@ FastAPI ── PostgreSQL（会话、计划、版本、任务、记忆、审计�
 1. 前端创建或恢复会话，通过 `X-Session-ID` 绑定请求。
 2. `POST /api/trip/plan` 在 PostgreSQL 创建任务并返回 `202 Accepted`。
 3. arq 将任务写入 Redis；Worker 获取任务并维护状态、租约和心跳。
-4. 后端读取用户偏好、短期历史和长期记忆，准备规划上下文。
+4. 后端读取用户偏好和短期历史，并用 pgvector 召回与当前城市/偏好相关的长期记忆，准备规划上下文。
 5. 景点、天气、酒店 Agent 并行采集信息，各自具有超时、重试和 fallback。
 6. Planner 汇总数据生成 `TripPlan`：
    - `PLANNER_BACKEND=pydantic_ai` 使用有调用预算、工具去重和输出重试的类型化 Planner；
@@ -81,7 +82,7 @@ FastAPI ── PostgreSQL（会话、计划、版本、任务、记忆、审计�
 
 - Python 3.11+
 - FastAPI、Pydantic V2、SQLAlchemy Async、Alembic
-- PostgreSQL 16、asyncpg、psycopg
+- PostgreSQL 16 + pgvector、asyncpg、psycopg
 - Redis、arq
 - LangGraph + PostgreSQL Checkpointer
 - Pydantic AI、OpenAI-compatible Chat Completions
@@ -119,6 +120,11 @@ REDIS_PASSWORD=replace-with-a-long-url-safe-password
 LLM_API_KEY=
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
+VECTOR_MEMORY_ENABLED=true
+EMBEDDING_MODEL=text-embedding-3-small
+# EMBEDDING_API_KEY/EMBEDDING_BASE_URL 留空时复用 LLM_*。
+EMBEDDING_API_KEY=
+EMBEDDING_BASE_URL=
 AMAP_API_KEY=
 BAIDU_MAP_API_KEY=
 UNSPLASH_ACCESS_KEY=
@@ -209,6 +215,12 @@ npm run dev
 | `ENABLE_PLAN_CRITIQUE` | `true` | 启用计划审视与修正 |
 | `MAX_REFINEMENT_ROUNDS` | `1` | 最大修正轮次；默认只做一次有针对性的重写 |
 | `MIN_PASS_SCORE` | `7.0` | Critic 最低通过分 |
+| `VECTOR_MEMORY_ENABLED` | `true` | 启用 pgvector 长期语义记忆；缺少嵌入 Key 时自动退回结构化记忆 |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI-compatible 的 1536 维嵌入模型 |
+| `VECTOR_MEMORY_TOP_K` | `5` | 每次规划最多召回的语义记忆数 |
+| `VECTOR_MEMORY_MIN_SIMILARITY` | `0.3` | 余弦相似度最低阈值 |
+| `VECTOR_MEMORY_MAX_ENTRIES_PER_USER` | `1000` | 每个用户保留的向量记忆上限 |
+
 Pydantic AI Planner 只有在外部服务和 LLM 都可用时才会生效；否则系统自动使用确定性 Planner。
 
 ### LangGraph 工作流版本
@@ -225,6 +237,12 @@ LANGGRAPH_STATE_SCHEMA_VERSION=2
 诊断模型自然完成耗时时，可临时将 `PYDANTIC_AI_MODEL_REQUEST_TIMEOUT_SECONDS`、`PLANNER_DRAFT_TIMEOUT_SECONDS`、`PLANNER_CRITIQUE_TIMEOUT_SECONDS` 与 `PLANNER_REFINE_TIMEOUT_SECONDS` 全部设为 `0`。`0` 表示禁用相应 Planner 阶段的硬超时，但 Worker 的 `TASK_WORKER_TIMEOUT_SECONDS` 总保护仍然生效；完成诊断后应恢复有限超时。
 
 `LANGGRAPH_CHECKPOINT_DSN` 可留空，Worker 会从 `DATABASE_URL` 派生 psycopg DSN。Planner 后端切换不会改变工作流或 checkpoint 格式。完整升级和恢复说明见 `docs/DEPLOYMENT.md`。
+
+### pgvector 长期记忆
+
+Compose 使用带 `vector` 扩展的 PostgreSQL 16 镜像。迁移 `005_pgvector_long_term_memory` 创建 1536 维 `memory_entries` 和 HNSW 余弦索引。行程成功后以计划 ID 幂等写入；收藏创建/删除会同步写入/清理向量记忆。查询始终按 `user_id` 隔离，并与结构化偏好、短期会话一起送入 Planner。
+
+嵌入调用和向量 SQL 使用独立故障边界：服务超时、Key 缺失或数据库尚未迁移时只跳过语义记忆，不影响行程发布。配置、迁移、运维和隐私说明见 `docs/VECTOR_MEMORY.md`。
 
 ## API 概览
 
@@ -298,10 +316,10 @@ npm run build
 npm run test:api-timeout
 ```
 
-2026-08-20 后端全量结果：
+2026-09-10 后端全量结果：
 
 ```text
-205 passed, 1 warning
+214 passed, 1 warning
 ```
 
 测试 warning 来自 `hello_agents` 对 Pydantic V2 旧式 class config 的弃用提示；容器启动日志另有 FastMCP 依赖的 Authlib JOSE 接口弃用提示。
@@ -321,6 +339,7 @@ docker compose --env-file .env.production -f compose.production.yml up -d --remo
 - 通过反向代理或负载均衡器终止 TLS；
 - 不在镜像或仓库中保存 Key；
 - 发布时先执行数据库迁移；
+- 确认 PostgreSQL 已启用 `vector` 扩展，并完成 migration `005_pgvector_long_term_memory`；
 - 定期运行 `ops/backup-postgres.sh` 并验证恢复；
 - 监控 Worker 心跳、恢复次数、任务阶段耗时和 checkpoint 表增长。
 
@@ -331,6 +350,7 @@ CI/CD、生产环境变量、回滚、备份和 LangGraph 灰度步骤详见 `do
 - README 描述的是当前代码；真实地图、LLM、MCP、图片和餐饮质量仍取决于有效 Key、配额与网络。
 - 高德 MCP 客户端固定为已验证的 `fastmcp==2.14.7`；MCP 进程不可用时可使用同一 Key 的高德 HTTP fallback。
 - LangGraph 始终启用；Pydantic AI 是默认 Planner，但仍需在目标模型和网络环境完成效果、时延与费用评测。
+- 向量记忆固定为 1536 维；更换嵌入模型时必须保证维度兼容。自建 LLM 端点不支持 embeddings 时应配置独立 `EMBEDDING_*` 或关闭向量记忆。
 - 测试覆盖控制流和故障边界，但不替代真实外部 API 的延迟、费用和内容质量评测。
 - 计划质量仍属于生成式问题，应持续维护固定场景数据集并跟踪路线、预算、重复率和天气适配指标。
 
@@ -338,6 +358,7 @@ CI/CD、生产环境变量、回滚、备份和 LangGraph 灰度步骤详见 `do
 
 - `docs/ENV_SETUP_GUIDE.md`：外部服务和 Key 配置
 - `docs/DEPLOYMENT.md`：CI/CD 与生产部署
+- `docs/VECTOR_MEMORY.md`：pgvector 长期记忆、迁移与故障处理
 - `docs/LangGraph_状态机集成计划.md`：耐久工作流设计
 - `docs/Pydantic_AI_集成技术报告.md`：类型化 Planner 设计与验证
 - `docs/async-task-optimization-plan.md`：异步任务模型

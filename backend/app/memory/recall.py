@@ -28,6 +28,12 @@ class MemoryRecall:
             for item in saved_items
             if (item.item_data or {}).get("city") == city
         ]
+        semantic_query = f"目的地：{city}；当前偏好：{preferences or '无明确偏好'}"
+        semantic_memories = await self._ltm.recall_semantic(
+            user_id=user_id,
+            db=db,
+            query=semantic_query,
+        )
 
         return {
             "preferred_categories": prefs.preferred_categories or [],
@@ -36,4 +42,5 @@ class MemoryRecall:
             "favorite_cities": prefs.favorite_cities or [],
             "saved_attractions_in_city": saved_attractions,
             "avg_trip_days": float(prefs.avg_trip_days) if prefs.avg_trip_days is not None else None,
+            "semantic_memories": semantic_memories,
         }

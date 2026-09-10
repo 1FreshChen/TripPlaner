@@ -74,7 +74,7 @@ async def lifespan(application: FastAPI):
         await asyncio.to_thread(close_amap_mcp_service)
 
 
-app = FastAPI(title="智能旅行助手 API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="智能旅行助手 API", version="0.4.0", lifespan=lifespan)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)

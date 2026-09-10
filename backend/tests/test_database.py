@@ -119,6 +119,7 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
         "conversation_messages",
         "user_preferences",
         "saved_items",
+        "memory_entries",
         "audit.event_log",
         "audit.token_usage",
     }.issubset(tables.keys())
@@ -157,6 +158,12 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
         assert column in tasks.columns
     assert "idx_trip_plan_tasks_recovery" in {index.name for index in tasks.indexes}
 
+    memory_entries = tables["memory_entries"]
+    assert str(memory_entries.columns.embedding.type) == "VECTOR(1536)"
+    assert "idx_memory_entries_embedding_hnsw" in {
+        index.name for index in memory_entries.indexes
+    }
+
 
 def test_initial_alembic_migration_contains_required_schema_objects():
     migration_path = "alembic/versions/001_initial.py"
@@ -172,5 +179,23 @@ def test_initial_alembic_migration_contains_required_schema_objects():
         '"event_log"',
         "schema=\"audit\"",
         "idx_token_usage_model",
+    ):
+        assert expected in migration
+
+
+def test_pgvector_memory_migration_enables_extension_and_hnsw_index():
+    migration_path = "alembic/versions/005_pgvector_long_term_memory.py"
+
+    with open(migration_path, encoding="utf-8") as migration_file:
+        migration = migration_file.read()
+
+    for expected in (
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        '"memory_entries"',
+        "VECTOR(1536)",
+        "uq_memory_entries_user_source",
+        "idx_memory_entries_embedding_hnsw",
+        'postgresql_using="hnsw"',
+        'postgresql_ops={"embedding": "vector_cosine_ops"}',
     ):
         assert expected in migration

@@ -42,6 +42,20 @@ LANGGRAPH_STATE_SCHEMA_VERSION=2
 
 迁移会把排队任务升级到当前工作流版本；没有 checkpoint 的运行中 legacy 任务会以 `WORKFLOW_UPGRADED` 结束，必须由调用方重新提交。上线检查应覆盖 checkpoint 初始化、独立 heartbeat、恢复 scanner，以及 `trip_plan_tasks` 的 `heartbeat_at/recovery_state/retry_count`。回退应用版本前必须确认数据库模式兼容，不能再依靠配置切回 legacy。
 
+### pgvector 长期记忆升级
+
+Alembic `005_pgvector_long_term_memory` 启用 PostgreSQL `vector` 扩展并创建长期语义记忆表与 HNSW 索引。Compose 的数据库镜像已固定为 `pgvector/pgvector:0.8.6-pg16-bookworm`；它与原来的 PostgreSQL 16 数据目录兼容，但升级前仍必须完成数据库备份。
+
+推荐顺序：
+
+1. 停止 API 和 Worker，保留 PostgreSQL/Redis 运行。
+2. 备份 PostgreSQL，并确认可恢复。
+3. 拉取新的 pgvector PostgreSQL 16 镜像，重建数据库容器。
+4. 执行 `alembic upgrade head`，确认 `vector` 扩展、`memory_entries` 表和 HNSW 索引存在。
+5. 配置 1536 维 OpenAI-compatible embedding 端点，再启动 API 和 Worker。
+
+如果托管数据库不允许应用账号执行 `CREATE EXTENSION`，先由数据库管理员执行 `CREATE EXTENSION IF NOT EXISTS vector`。应用回退不会自动删除向量表；migration downgrade 只删除 `memory_entries`，不会删除可能被其他服务共用的扩展。
+
 ## GitHub 配置
 
 在仓库 Settings → Environments 新建 `production`，建议启用审批和 `main` 分支限制。
@@ -90,6 +104,7 @@ ssh-keyscan -p 22 your-server.example.com
 - `ENCRYPTION_KEY`：有效 Fernet key。
 - `FRONTEND_ORIGIN`：生产站点的 HTTPS Origin。
 - 各外部服务 API Key；若不使用外部服务，将 `ENABLE_EXTERNAL_SERVICES=false` 和 `AMAP_MCP_ENABLED=false`。
+- `EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`：可留空 Key/URL 以复用 `LLM_*`；模型必须支持 1536 维。端点不支持 embeddings 时设置 `VECTOR_MEMORY_ENABLED=false`。
 
 生产镜像已固定安装 `@amap/amap-maps-mcp-server@0.0.8`，环境模板通过 `mcp-amap` 直接启动，避免容器运行时从 npm 拉取浮动的 latest 版本。模板默认关闭 MCP 并使用现有 HTTP fallback，因为项目锁定的 `hello-agents 0.2.9` 限制 FastMCP `<3.0`，而当前修复版本为 3.x；只有在完成兼容升级或风险评估后再开启 MCP。
 

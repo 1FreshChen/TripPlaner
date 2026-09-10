@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PlannerBackendName = Literal["pydantic_ai", "openai_tools", "deterministic"]
+VECTOR_MEMORY_DIMENSIONS = 1536
 
 
 class Settings(BaseSettings):
@@ -14,6 +15,23 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_base_url: str = Field(default="https://api.openai.com/v1", alias="LLM_BASE_URL")
     llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    vector_memory_enabled: bool = Field(default=True, alias="VECTOR_MEMORY_ENABLED")
+    embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
+    embedding_base_url: str = Field(default="", alias="EMBEDDING_BASE_URL")
+    embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
+    embedding_timeout_seconds: float = Field(default=20.0, ge=1.0, alias="EMBEDDING_TIMEOUT_SECONDS")
+    vector_memory_top_k: int = Field(default=5, ge=1, le=20, alias="VECTOR_MEMORY_TOP_K")
+    vector_memory_min_similarity: float = Field(
+        default=0.3,
+        ge=-1.0,
+        le=1.0,
+        alias="VECTOR_MEMORY_MIN_SIMILARITY",
+    )
+    vector_memory_max_entries_per_user: int = Field(
+        default=1000,
+        ge=10,
+        alias="VECTOR_MEMORY_MAX_ENTRIES_PER_USER",
+    )
     amap_api_key: str = Field(default="", alias="AMAP_API_KEY")
     amap_mcp_enabled: bool = Field(default=True, alias="AMAP_MCP_ENABLED")
     amap_mcp_command: str = Field(default="npx", alias="AMAP_MCP_COMMAND")
