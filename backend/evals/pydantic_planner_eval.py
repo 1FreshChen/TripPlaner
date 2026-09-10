@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import EqualsExpected
 
-from app.agents.pydantic_planner import PlannerToolState
+from app.agents.planner.pydantic_support import PlannerToolState
 from app.models.schemas import TripPlanRequest
 
 
@@ -71,11 +71,11 @@ TOOL_CONVERGENCE_DATASET = Dataset(
             ),
         ),
         Case(
-            name="food-preference-shows-one-restaurant-tool",
+            name="food-preference-defers-to-http-postprocessing",
             inputs=ToolPolicyEvalInput(preferences="历史文化和美食"),
             expected_output=ToolPolicyEvalOutput(
                 baseline_sufficient=True,
-                visible_tools=["baidu_poi_search"],
+                visible_tools=[],
             ),
         ),
         Case(

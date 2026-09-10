@@ -6,8 +6,9 @@ from typing import Any, Dict, List, Optional
 from pydantic import ValidationError
 
 from app.agents.critic import PlanCritic
+from app.agents.planner.validation import parse_planner_output, validate_planner_output
 from app.agents.prompts import PLANNER_AGENT_PROMPT
-from app.agents.trip_planner import (
+from app.agents.planner.prompting import (
     build_planner_query,
     summarize_attractions,
     summarize_hotels,
@@ -16,10 +17,9 @@ from app.agents.trip_planner import (
 from app.models.schemas import Attraction, CritiqueResult, Hotel, TripPlan, TripPlanRequest, WeatherInfo
 from app.orchestration.base import BaseAgent
 from app.services.llm_service import LLMService, TokenUsage
-from app.services.plan_quality import PlanQualityError, validate_trip_plan_for_request
+from app.services.plan_quality import PlanQualityError
 from app.tools.executor import ToolExecutor
 from app.tools.registry import ToolRegistry
-from app.utils.json_utils import strip_json_fence
 
 
 class LLMPlannerAgent(BaseAgent):
@@ -90,6 +90,42 @@ class LLMPlannerAgent(BaseAgent):
         context["trip_planner_token_usage"] = usage
         return trip_plan
 
+    async def refine_once(
+        self,
+        context: Dict[str, Any],
+        previous_plan: TripPlan,
+        critique: CritiqueResult,
+    ) -> TripPlan:
+        """Apply exactly one revision so orchestration can checkpoint each stage."""
+        request: TripPlanRequest = context["request"]
+        base_prompt = self._build_user_prompt(
+            request=request,
+            attractions=context["attraction_search"],
+            weather_info=context["weather_query"],
+            hotels=context["hotel_recommendation"],
+            memory_context=context.get("memory_context"),
+            conversation_context=context.get("conversation_context"),
+        )
+        revision_prompt = self._build_revision_prompt(base_prompt, previous_plan, critique)
+        revised_text, tool_calls, usage = await self.llm_service.chat_with_tools(
+            system_prompt=PLANNER_AGENT_PROMPT,
+            user_prompt=revision_prompt,
+            tools=self.tool_registry.get_openai_functions(),
+            tool_executor=self.tool_executor,
+            max_tool_rounds=1,
+            response_format={"type": "json_object"},
+        )
+        revised_plan, correction_usage = await self._parse_and_validate(revised_text, request)
+        if correction_usage:
+            usage = self._merge_usage(usage, correction_usage)
+        context["trip_planner_tool_calls"] = list(tool_calls)
+        context["trip_planner_token_usage"] = usage
+        context["trip_planner_diagnostics"] = {
+            "stage": "refinement_completed",
+            "model_requests": 1 + int(correction_usage is not None),
+        }
+        return revised_plan
+
     def _build_user_prompt(
         self,
         request: TripPlanRequest,
@@ -114,8 +150,7 @@ class LLMPlannerAgent(BaseAgent):
         request: TripPlanRequest,
     ) -> tuple[TripPlan, Optional[TokenUsage]]:
         try:
-            trip_plan = self._load_trip_plan(text)
-            validate_trip_plan_for_request(trip_plan, request)
+            trip_plan = parse_planner_output(text, request)
             return trip_plan, None
         except (json.JSONDecodeError, ValidationError, TypeError, ValueError, PlanQualityError) as exc:
             issue_type = "质量校验失败" if isinstance(exc, PlanQualityError) else "格式错误"
@@ -132,13 +167,8 @@ class LLMPlannerAgent(BaseAgent):
                 tool_executor=self.tool_executor,
                 max_tool_rounds=1,
             )
-            trip_plan = self._load_trip_plan(corrected_text)
-            validate_trip_plan_for_request(trip_plan, request)
+            trip_plan = parse_planner_output(corrected_text, request)
             return trip_plan, correction_usage
-
-    def _load_trip_plan(self, text: str) -> TripPlan:
-        payload = json.loads(strip_json_fence(text))
-        return TripPlan.model_validate(payload)
 
     async def _refine_with_critique(
         self,
@@ -165,7 +195,7 @@ class LLMPlannerAgent(BaseAgent):
                         f"审查器仍要求修改或评分过低：needs_revision={critique.needs_revision}, "
                         f"average_score={critique.average_score}, summary={critique.revision_summary}"
                     )
-                validate_trip_plan_for_request(
+                validate_planner_output(
                     current_plan,
                     request,
                     critique_events=context.get("plan_critique_events", []),

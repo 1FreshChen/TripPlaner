@@ -2,6 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ThinkingPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import FunctionModel
@@ -9,9 +10,9 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage
 
 from app.agents.llm_planner import LLMPlannerAgent
-from app.agents.pydantic_planner import (
+from app.agents.pydantic_planner import PydanticAIPlannerAgent
+from app.agents.planner.pydantic_support import (
     PYDANTIC_PLANNER_TOOLS,
-    PydanticAIPlannerAgent,
     PlannerDeps,
     PlannerToolState,
     _execute_tool,
@@ -106,20 +107,18 @@ class FakeExecutor:
         return {"success": True, "count": 3, "city": kwargs.get("city")}
 
 
-def test_bootstrap_keeps_legacy_llm_planner_by_default_and_enables_typed_planner_explicitly():
+def test_bootstrap_selects_each_model_planner_explicitly():
     old_registry = bootstrap_orchestration(
         llm_service=FakeLLMService(),
         enable_external_services=True,
-        enable_llm_tool_planning=True,
-        enable_pydantic_ai_planner=False,
+        planner_backend="openai_tools",
         tool_registry=FakeRegistry(),
         tool_executor=FakeExecutor(),
     )
     new_registry = bootstrap_orchestration(
         llm_service=FakeLLMService(),
         enable_external_services=True,
-        enable_llm_tool_planning=True,
-        enable_pydantic_ai_planner=True,
+        planner_backend="pydantic_ai",
         tool_registry=FakeRegistry(),
         tool_executor=FakeExecutor(),
     )
@@ -128,14 +127,13 @@ def test_bootstrap_keeps_legacy_llm_planner_by_default_and_enables_typed_planner
     assert isinstance(new_registry.get("trip_planner").create_agent(), PydanticAIPlannerAgent)
 
 
-def test_all_seven_tools_have_typed_generated_schemas():
+def test_all_planner_tools_have_typed_generated_schemas():
     schemas = {tool.name: tool.tool_def.parameters_json_schema for tool in PYDANTIC_PLANNER_TOOLS}
 
     assert set(schemas) == {
         "amap_poi_search",
         "amap_weather",
         "hotel_search",
-        "baidu_poi_search",
         "baidu_direction",
         "budget_calculator",
         "unsplash_image",
@@ -159,7 +157,7 @@ def test_tool_visibility_is_staged_and_sufficient_baseline_hides_everything():
 
     assert sufficient.visible_tool_names() == set()
     assert missing.visible_tool_names() == {"amap_poi_search", "amap_weather", "hotel_search"}
-    assert food_only.visible_tool_names() == {"baidu_poi_search"}
+    assert food_only.visible_tool_names() == set()
 
 
 def test_equivalent_tool_arguments_are_deduplicated_before_external_execution():
@@ -184,6 +182,29 @@ def test_equivalent_tool_arguments_are_deduplicated_before_external_execution():
     assert state.tool_calls[-1]["duplicate"] is True
 
 
+def test_amap_tool_results_are_preserved_for_final_poi_verification():
+    state = PlannerToolState(_request(), 0, 2, 1)
+    pois = [
+        {
+            "id": "poi-1",
+            "name": "明孝陵景区",
+            "address": "南京市玄武区",
+            "location": "118.835,32.059",
+            "_source": "amap_mcp",
+        }
+    ]
+
+    state.record_result(
+        "amap_poi_search",
+        {"keywords": "明孝陵", "city": "南京"},
+        {"success": True, "count": 1, "pois": pois},
+        tool_call_id="call-poi",
+    )
+
+    assert state.amap_pois == pois
+    assert state.diagnostics()["verified_amap_pois"] == 1
+
+
 class FakeHTTPResponse:
     def __init__(self, body):
         self.body = body
@@ -203,6 +224,67 @@ class RecordingHTTPClient:
     async def post(self, url, headers, json):
         self.requests.append(json)
         return FakeHTTPResponse(self.responses.pop(0))
+
+
+class SlowHTTPClient:
+    async def post(self, url, headers, json):
+        await asyncio.sleep(0.05)
+        return FakeHTTPResponse(
+            {
+                "id": "slow-response",
+                "model": "deepseek-test",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": "{}"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+        )
+
+
+def test_model_request_timeout_identifies_the_exact_planner_stage():
+    request = _request()
+    state = PlannerToolState(request, 4, 2, 1)
+    state.current_stage = "initial_generation"
+    service = LLMService("test-key", "https://api.deepseek.com", "deepseek-test")
+    model = OpenAICompatiblePydanticModel(
+        service,
+        state,
+        timeout_seconds=0.01,
+        http_client=SlowHTTPClient(),
+    )
+    params = ModelRequestParameters(function_tools=[], output_mode="prompted")
+    request_message = ModelRequest(parts=[UserPromptPart("规划北京")], instructions="system")
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"initial_generation\.model_request_1",
+    ):
+        asyncio.run(model.request([request_message], None, params))
+
+    assert state.model_requests == 1
+    assert state.current_stage == "initial_generation.model_request_1"
+
+
+def test_zero_model_request_timeout_waits_for_natural_completion():
+    request = _request()
+    state = PlannerToolState(request, 4, 2, 1)
+    service = LLMService("test-key", "https://api.deepseek.com", "deepseek-test")
+    model = OpenAICompatiblePydanticModel(
+        service,
+        state,
+        timeout_seconds=0,
+        http_client=SlowHTTPClient(),
+    )
+    params = ModelRequestParameters(function_tools=[], output_mode="prompted")
+    request_message = ModelRequest(parts=[UserPromptPart("规划北京")], instructions="system")
+
+    response = asyncio.run(model.request([request_message], None, params))
+
+    assert response.model_name == "deepseek-test"
+    assert state.model_requests == 1
 
 
 def test_deepseek_reasoning_is_replayed_and_tool_round_limit_forces_json_without_tools():

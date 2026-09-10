@@ -32,7 +32,6 @@ class PlanningWorkflowService:
         config = {
             "configurable": {
                 "thread_id": task_id,
-                "checkpoint_ns": workflow_version,
             }
         }
         snapshot = await self._graph.aget_state(config)

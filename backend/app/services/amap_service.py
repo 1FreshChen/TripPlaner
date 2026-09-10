@@ -140,6 +140,18 @@ class AmapService:
                 )
                 response.raise_for_status()
                 payload = response.json()
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_error = exc
+                if attempt < settings.amap_qps_retry_attempts:
+                    logger.warning(
+                        "Amap transient request failure; retrying %s attempt=%d/%d error=%s",
+                        path,
+                        attempt + 1,
+                        settings.amap_qps_retry_attempts + 1,
+                        exc,
+                    )
+                    continue
+                break
             except Exception as exc:
                 last_error = exc
                 break
@@ -166,6 +178,7 @@ class AmapService:
                     "city": city,
                     "key": self.api_key,
                     "output": "json",
+                    "extensions": "all",
                     "offset": offset,
                     "page": 1,
                 },
@@ -173,10 +186,17 @@ class AmapService:
             if payload.get("status") != "1":
                 logger.warning("Amap POI search failed: %s", payload)
                 return ServiceResult(
-                    error=f"AMap API error: {payload.get('info') or 'unknown error'}",
+                    error=(
+                        f"AMap API error: info={payload.get('info') or 'unknown error'}, "
+                        f"infocode={payload.get('infocode') or 'unknown'}"
+                    ),
                     error_kind="provider",
                 )
-            return ServiceResult(data=payload.get("pois", []))
+            pois = payload.get("pois", []) or []
+            for poi in pois:
+                if isinstance(poi, dict):
+                    poi["_source"] = "amap_http"
+            return ServiceResult(data=pois)
         except requests.Timeout as exc:
             logger.warning("Amap POI request timed out: %s", exc)
             return ServiceResult(error="AMap API timeout", error_kind="timeout")
@@ -189,6 +209,33 @@ class AmapService:
                 error=f"AMap API unexpected error: {exc}",
                 error_kind="unexpected",
             )
+
+    def get_poi_detail(self, poi_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one extended POI record through the HTTP API."""
+        if not self.enabled or not poi_id:
+            return None
+        try:
+            payload = self._request_json(
+                "/place/detail",
+                {
+                    "id": poi_id,
+                    "key": self.api_key,
+                    "output": "json",
+                    "extensions": "all",
+                },
+            )
+            if payload.get("status") != "1":
+                logger.warning("Amap POI detail failed: %s", payload)
+                return None
+            pois = payload.get("pois", []) or []
+            if not pois or not isinstance(pois[0], dict):
+                return None
+            detail = dict(pois[0])
+            detail["_source"] = "amap_http"
+            return detail
+        except Exception as exc:
+            logger.warning("Amap POI detail request failed for %s: %s", poi_id, exc)
+            return None
 
     def get_weather(self, city: str) -> ServiceResult[WeatherInfo]:
         if not self.enabled:
@@ -204,7 +251,10 @@ class AmapService:
             if payload.get("status") not in (None, "1"):
                 logger.warning("Amap weather query failed: %s", payload)
                 return ServiceResult(
-                    error=f"AMap API error: {payload.get('info') or 'unknown error'}",
+                    error=(
+                        f"AMap API error: info={payload.get('info') or 'unknown error'}, "
+                        f"infocode={payload.get('infocode') or 'unknown'}"
+                    ),
                     error_kind="provider",
                 )
             forecasts = payload.get("forecasts", [])
@@ -255,6 +305,21 @@ class AmapService:
             return {}
         return biz_ext
 
+    @staticmethod
+    def _first_photo_url(poi: Dict) -> Optional[str]:
+        photos = poi.get("photos") or []
+        if isinstance(photos, dict):
+            photos = [photos]
+        if not isinstance(photos, list):
+            return None
+        for photo in photos:
+            if not isinstance(photo, dict):
+                continue
+            url = photo.get("url") or photo.get("image_url")
+            if isinstance(url, str) and url.strip():
+                return url.strip()
+        return None
+
     def poi_to_attraction(self, poi: Dict, preferences: str) -> Optional[Attraction]:
         location = self.parse_location(poi.get("location"))
         if not location:
@@ -268,6 +333,11 @@ class AmapService:
             description=f"根据{preferences}偏好从高德地图搜索得到的目的地。",
             category=poi.get("type", "景点"),
             rating=float(rating) if rating not in (None, "", []) else None,
+            image_url=self._first_photo_url(poi),
+            poi_id=str(poi.get("id") or "") or None,
+            data_source=str(poi.get("_source") or "amap_http"),
+            image_source="amap" if self._first_photo_url(poi) else None,
+            coordinate_verified=True,
             ticket_price=0,
         )
 

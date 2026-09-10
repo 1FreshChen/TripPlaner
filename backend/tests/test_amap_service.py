@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 from app.config import get_settings
 from app.services import amap_service
@@ -8,6 +9,7 @@ from app.services.amap_service import (
     is_qps_limit_error,
     reset_amap_rate_limiter,
 )
+from app.models.schemas import Location
 
 
 class FakeClock:
@@ -84,7 +86,7 @@ def test_search_pois_retries_qps_limit_then_succeeds(monkeypatch):
     result = AmapService("test-key").search_pois("museum", "TestCity")
 
     assert len(calls) == 2
-    assert result.data == [{"id": "poi-1", "name": "Museum"}]
+    assert result.data == [{"id": "poi-1", "name": "Museum", "_source": "amap_http"}]
 
 
 def test_search_pois_does_not_retry_non_qps_errors(monkeypatch):
@@ -124,3 +126,94 @@ def test_search_pois_exhausts_qps_retries_then_reports_provider_error(monkeypatc
     assert result.is_error
     assert result.error_kind == "provider"
     assert "CUQPS" in result.error
+
+
+def test_search_pois_requests_extended_poi_fields(monkeypatch):
+    captured_params = {}
+
+    def fake_get(url, params, timeout):
+        captured_params.update(params)
+        return FakeResponse({"status": "1", "pois": []})
+
+    monkeypatch.setattr(amap_service.requests, "get", fake_get)
+
+    result = AmapService("test-key").search_pois("museum", "TestCity")
+
+    assert not result.is_error
+    assert captured_params["extensions"] == "all"
+
+
+def test_search_pois_retries_transient_timeout_then_succeeds(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "1")
+    get_settings.cache_clear()
+    reset_amap_rate_limiter()
+    calls = []
+
+    def fake_get(url, params, timeout):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.Timeout("temporary timeout")
+        return FakeResponse({"status": "1", "pois": []})
+
+    monkeypatch.setattr(amap_service.requests, "get", fake_get)
+
+    result = AmapService("test-key").search_pois("museum", "TestCity")
+
+    assert not result.is_error
+    assert len(calls) == 2
+
+
+def test_provider_error_includes_amap_infocode(monkeypatch):
+    monkeypatch.setattr(
+        amap_service.requests,
+        "get",
+        lambda url, params, timeout: FakeResponse(
+            {"status": "0", "info": "INVALID_USER_KEY", "infocode": "10001"}
+        ),
+    )
+
+    result = AmapService("test-key").search_pois("museum", "TestCity")
+
+    assert result.is_error
+    assert "INVALID_USER_KEY" in result.error
+    assert "10001" in result.error
+
+
+def test_poi_to_attraction_uses_first_available_photo_url():
+    attraction = AmapService("test-key").poi_to_attraction(
+        {
+            "name": "Museum",
+            "address": "Test Road",
+            "location": "116.397128,39.916527",
+            "photos": [
+                {"title": "front", "url": "https://example.test/museum.jpg"},
+                {"title": "inside", "url": "https://example.test/inside.jpg"},
+            ],
+        },
+        "history",
+    )
+
+    assert attraction is not None
+    assert attraction.location == Location(longitude=116.397128, latitude=39.916527)
+    assert attraction.image_url == "https://example.test/museum.jpg"
+    assert attraction.image_source == "amap"
+    assert attraction.data_source == "amap_http"
+    assert attraction.coordinate_verified is True
+
+
+def test_get_poi_detail_requests_extended_fields(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params, timeout):
+        captured.update({"url": url, "params": params})
+        return FakeResponse(
+            {"status": "1", "pois": [{"id": "poi-1", "location": "1,2"}]}
+        )
+
+    monkeypatch.setattr(amap_service.requests, "get", fake_get)
+
+    detail = AmapService("test-key").get_poi_detail("poi-1")
+
+    assert captured["url"].endswith("/place/detail")
+    assert captured["params"]["extensions"] == "all"
+    assert detail == {"id": "poi-1", "location": "1,2", "_source": "amap_http"}

@@ -357,7 +357,16 @@ class AmapMCPService(AmapService):
             pois = self._extract_pois(payload)
             normalized = self._enrich_pois(pois[:limit])
             results = [item for item in normalized if item]
-            if results:
+            usable_results = [
+                item for item in results if self.parse_location(item.get("location"))
+            ]
+            if usable_results:
+                for item in usable_results:
+                    item.setdefault("_source", "amap_mcp")
+                return ServiceResult(data=usable_results, source="amap_mcp")
+            if results and not self._http_fallback:
+                for item in results:
+                    item.setdefault("_source", "amap_mcp")
                 return ServiceResult(data=results, source="amap_mcp")
             fallback = self._fallback_search(keywords, city, limit)
             if fallback.data or fallback.is_error:
@@ -477,10 +486,12 @@ class AmapMCPService(AmapService):
         normalized = [self._normalize_poi(poi) for poi in pois]
         detail_calls = 0
         detail_limit = get_settings().amap_enrich_detail_limit
+        if detail_limit <= 0:
+            return normalized
         for poi in normalized:
             if self.parse_location(poi.get("location")) or not poi.get("id"):
                 continue
-            if detail_limit > 0 and detail_calls >= detail_limit:
+            if detail_calls >= detail_limit:
                 continue
             detail_calls += 1
             detail = self._fetch_poi_detail(poi["id"])
@@ -499,11 +510,17 @@ class AmapMCPService(AmapService):
             payload = self._call_mcp(self.DETAIL_TOOL_NAMES, {"id": poi_id})
             details = self._extract_pois(payload)
             if details:
-                return self._normalize_poi(details[0])
+                detail = self._normalize_poi(details[0])
+                detail["_source"] = "amap_mcp"
+                return detail
         except LookupError:
-            logger.debug("AMap MCP detail tool unavailable; skipping detail for %s", poi_id)
+            logger.info("AMap MCP detail tool unavailable; trying HTTP detail for %s", poi_id)
         except Exception as exc:
-            logger.debug("AMap MCP POI detail failed for %s: %s", poi_id, exc)
+            logger.warning("AMap MCP POI detail failed for %s; trying HTTP detail: %s", poi_id, exc)
+        if self._http_fallback:
+            detail = super().get_poi_detail(poi_id)
+            if detail:
+                return self._normalize_poi(detail)
         return None
 
     @staticmethod

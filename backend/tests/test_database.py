@@ -148,7 +148,6 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
     for column in (
         "heartbeat_at",
         "lease_owner",
-        "orchestration_backend",
         "workflow_version",
         "state_schema_version",
         "recovery_state",

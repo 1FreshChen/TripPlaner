@@ -1,36 +1,20 @@
 from app.config import Settings
 
 
-def test_settings_use_enhanced_prompt_defaults_to_true(monkeypatch):
-    monkeypatch.delenv("USE_ENHANCED_PROMPT", raising=False)
+def test_settings_planner_backend_defaults_to_pydantic_ai(monkeypatch):
+    monkeypatch.delenv("PLANNER_BACKEND", raising=False)
 
     settings = Settings()
 
-    assert settings.use_enhanced_prompt is True
+    assert settings.planner_backend == "pydantic_ai"
 
 
-def test_settings_use_enhanced_prompt_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("USE_ENHANCED_PROMPT", "false")
-
-    settings = Settings()
-
-    assert settings.use_enhanced_prompt is False
-
-
-def test_settings_enable_llm_tool_planning_defaults_to_true(monkeypatch):
-    monkeypatch.delenv("ENABLE_LLM_TOOL_PLANNING", raising=False)
+def test_settings_planner_backend_can_select_openai_tools(monkeypatch):
+    monkeypatch.setenv("PLANNER_BACKEND", "openai_tools")
 
     settings = Settings()
 
-    assert settings.enable_llm_tool_planning is True
-
-
-def test_settings_enable_llm_tool_planning_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("ENABLE_LLM_TOOL_PLANNING", "false")
-
-    settings = Settings()
-
-    assert settings.enable_llm_tool_planning is False
+    assert settings.planner_backend == "openai_tools"
 
 
 def test_settings_enable_plan_critique_defaults_to_true(monkeypatch):

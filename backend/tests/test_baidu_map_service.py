@@ -1,4 +1,10 @@
-from app.services.baidu_map_service import BaiduMapService
+from app.config import get_settings
+from app.services.baidu_map_service import (
+    BaiduMapService,
+    BaiduRateLimiter,
+    is_baidu_qps_limit_error,
+    reset_baidu_rate_limiter,
+)
 
 
 class FakeResponse:
@@ -47,6 +53,46 @@ def test_search_pois_sends_scope_2_and_sort_params(monkeypatch):
         "sort_name": "taste_rating",
     }
     assert calls[0]["timeout"] == 10
+
+
+def test_search_pois_supports_nearby_location(monkeypatch):
+    calls = []
+
+    def fake_get(url, params, timeout):
+        calls.append({"url": url, "params": params})
+        return FakeResponse({"status": 0, "results": []})
+
+    monkeypatch.setattr("app.services.baidu_map_service.requests.get", fake_get)
+    service = BaiduMapService("baidu-key")
+
+    service.search_pois(
+        "早餐",
+        "青岛",
+        tag="美食",
+        location=service.parse_location({"lng": 120.3, "lat": 36.0}),
+        radius=8000,
+    )
+
+    assert "region" not in calls[0]["params"]
+    assert calls[0]["params"]["location"] == "36.0,120.3"
+    assert calls[0]["params"]["radius"] == 8000
+
+
+def test_get_poi_detail_uses_uid_and_scope_2(monkeypatch):
+    calls = []
+
+    def fake_get(url, params, timeout):
+        calls.append({"url": url, "params": params})
+        return FakeResponse({"status": 0, "result": {"uid": "poi-1", "name": "餐厅"}})
+
+    monkeypatch.setattr("app.services.baidu_map_service.requests.get", fake_get)
+
+    result = BaiduMapService("baidu-key").get_poi_detail("poi-1")
+
+    assert result == {"uid": "poi-1", "name": "餐厅"}
+    assert calls[0]["url"].endswith("/place/v2/detail")
+    assert calls[0]["params"]["uid"] == "poi-1"
+    assert calls[0]["params"]["scope"] == 2
 
 
 def test_poi_to_restaurant_extracts_baidu_detail_fields():
@@ -133,3 +179,39 @@ def test_get_direction_parses_route_distance_and_duration(monkeypatch):
         "destination": "39.8,116.2",
         "ak": "baidu-key",
     }
+
+
+def test_baidu_qps_detection_and_rate_limiter_spacing():
+    now = [100.0]
+    sleeps = []
+    limiter = BaiduRateLimiter(2.0, clock=lambda: now[0], sleeper=sleeps.append)
+
+    assert is_baidu_qps_limit_error({"status": 401, "message": "当前并发量已经超过约定并发配额，限制访问"})
+    assert not is_baidu_qps_limit_error({"status": 5, "message": "AK不存在"})
+    limiter.wait()
+    limiter.wait()
+
+    assert sleeps == [0.5]
+
+
+def test_baidu_qps_limit_retries_then_succeeds(monkeypatch):
+    monkeypatch.setenv("BAIDU_QPS_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("BAIDU_QPS_RETRY_DELAY_SECONDS", "0")
+    get_settings.cache_clear()
+    reset_baidu_rate_limiter()
+    payloads = [
+        {"status": 401, "message": "当前并发量已经超过约定并发配额，限制访问"},
+        {"status": 0, "results": [{"uid": "poi-1", "name": "餐厅"}]},
+    ]
+    calls = []
+
+    def fake_get(url, params, timeout):
+        calls.append(url)
+        return FakeResponse(payloads.pop(0))
+
+    monkeypatch.setattr("app.services.baidu_map_service.requests.get", fake_get)
+
+    results = BaiduMapService("baidu-key").search_pois("早餐", "南京")
+
+    assert results == [{"uid": "poi-1", "name": "餐厅"}]
+    assert len(calls) == 2

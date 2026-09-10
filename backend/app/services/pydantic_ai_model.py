@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import time
 from typing import Any, Iterable, Protocol
 
 import httpx
@@ -22,6 +25,9 @@ from pydantic_ai.usage import RequestUsage
 from app.services.llm_service import LLMService
 
 
+logger = logging.getLogger(__name__)
+
+
 class ToolLoopState(Protocol):
     """Minimal state shared by the provider adapter and the planner."""
 
@@ -31,6 +37,7 @@ class ToolLoopState(Protocol):
     max_tool_rounds: int
     max_tool_calls: int
     force_finalize: bool
+    current_stage: str
 
 
 class OpenAICompatiblePydanticModel(Model):
@@ -48,13 +55,15 @@ class OpenAICompatiblePydanticModel(Model):
         llm_service: LLMService,
         loop_state: ToolLoopState,
         *,
-        timeout_seconds: float = 180.0,
+        timeout_seconds: float | None = 180.0,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         super().__init__()
         self._llm_service = llm_service
         self._loop_state = loop_state
-        self._timeout_seconds = timeout_seconds
+        self._timeout_seconds = (
+            None if timeout_seconds is not None and timeout_seconds <= 0 else timeout_seconds
+        )
         self._http_client = http_client
 
     @property
@@ -78,6 +87,9 @@ class OpenAICompatiblePydanticModel(Model):
         model_settings, params = self.prepare_request(model_settings, model_request_parameters)
         state = self._loop_state
         state.model_requests += 1
+        request_index = state.model_requests
+        stage = getattr(state, "current_stage", "model_generation")
+        request_stage = f"{stage}.model_request_{request_index}"
 
         force_finalize = (
             state.force_finalize
@@ -114,7 +126,51 @@ class OpenAICompatiblePydanticModel(Model):
             # constraint during the forced-finalization turn.
             payload["response_format"] = {"type": "json_object"}
 
-        body = await self._post(payload)
+        started_at = time.monotonic()
+        timeout_label = (
+            "disabled" if self._timeout_seconds is None else f"{self._timeout_seconds:.1f}s"
+        )
+        logger.info(
+            "Planner model request started: stage=%s timeout=%s tools=%d",
+            request_stage,
+            timeout_label,
+            len(function_tools),
+        )
+        try:
+            if self._timeout_seconds is None:
+                body = await self._post(payload)
+            else:
+                body = await asyncio.wait_for(
+                    self._post(payload),
+                    timeout=self._timeout_seconds,
+                )
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            state.current_stage = request_stage
+            logger.warning(
+                "Planner model request timed out: stage=%s duration_ms=%.3f error_type=%s",
+                request_stage,
+                (time.monotonic() - started_at) * 1000,
+                type(exc).__name__,
+            )
+            raise TimeoutError(
+                f"Planner model request timed out at {request_stage} "
+                f"after {self._timeout_seconds:.1f}s"
+            ) from exc
+        except Exception as exc:
+            state.current_stage = request_stage
+            logger.warning(
+                "Planner model request failed: stage=%s duration_ms=%.3f error_type=%s error=%s",
+                request_stage,
+                (time.monotonic() - started_at) * 1000,
+                type(exc).__name__,
+                str(exc).strip() or type(exc).__name__,
+            )
+            raise
+        logger.info(
+            "Planner model request completed: stage=%s duration_ms=%.3f",
+            request_stage,
+            (time.monotonic() - started_at) * 1000,
+        )
         choice = body["choices"][0]
         message = choice.get("message") or {}
         parts = self._response_parts(message)

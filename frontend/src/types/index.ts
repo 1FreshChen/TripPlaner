@@ -12,6 +12,10 @@ export interface Attraction {
   category?: string
   rating?: number
   image_url?: string
+  poi_id?: string
+  data_source?: string
+  image_source?: string
+  coordinate_verified?: boolean
   ticket_price?: number
 }
 
@@ -27,6 +31,8 @@ export interface Meal {
   price_per_person?: number
   shop_hours?: string
   comment_num?: number
+  data_source?: string
+  poi_id?: string
 }
 
 export interface Hotel {
@@ -104,6 +110,9 @@ export type TaskPhase =
   | 'queued'
   | 'preparing'
   | 'collecting_context'
+  | 'draft_planning'
+  | 'critiquing'
+  | 'refining'
   | 'llm_planning'
   | 'validating'
   | 'meal_enrichment'

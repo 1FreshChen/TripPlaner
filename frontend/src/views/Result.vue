@@ -131,13 +131,34 @@
                     :key="`${day.date}-${attraction.name}-${attractionIndex}`"
                     class="attraction-item"
                   >
-                    <div>
-                      <div class="item-title">
-                        <span>{{ attraction.name }}</span>
-                        <a-tag>{{ attraction.category || '景点' }}</a-tag>
-                        <a-tag color="green">¥{{ attraction.ticket_price || 0 }}</a-tag>
+                    <div class="attraction-main">
+                      <div class="attraction-image-frame">
+                        <img
+                          v-if="attraction.image_url && !brokenImageUrls.has(attraction.image_url)"
+                          class="attraction-image"
+                          :src="attraction.image_url"
+                          :alt="`${attraction.name}景点图片`"
+                          loading="lazy"
+                          decoding="async"
+                          @error="markImageBroken(attraction.image_url)"
+                        />
+                        <div v-else class="attraction-image-placeholder">暂无图片</div>
                       </div>
-                      <div class="item-meta">{{ attraction.address }} · {{ attraction.visit_duration }} 分钟</div>
+                      <div class="attraction-copy">
+                        <div class="item-title">
+                          <span>{{ attraction.name }}</span>
+                          <a-tag>{{ attraction.category || '景点' }}</a-tag>
+                          <a-tag color="green">¥{{ attraction.ticket_price || 0 }}</a-tag>
+                          <a-tag :color="attraction.coordinate_verified ? 'blue' : 'default'">
+                            {{ attraction.coordinate_verified ? '坐标已核验' : '坐标未核验' }}
+                          </a-tag>
+                          <a-tag v-if="attraction.image_source">
+                            图片：{{ attraction.image_source === 'amap' ? '高德' : attraction.image_source === 'unsplash' ? 'Unsplash' : '模型' }}
+                          </a-tag>
+                        </div>
+                        <div class="item-meta">{{ attraction.address }} · {{ attraction.visit_duration }} 分钟</div>
+                        <div v-if="attraction.description" class="item-desc">{{ attraction.description }}</div>
+                      </div>
                     </div>
                     <div v-if="editMode" class="inline-actions">
                       <a-tooltip title="上移">
@@ -173,6 +194,9 @@
                     <div class="meal-info">
                       <div class="item-title">
                         {{ meal.name }}
+                        <a-tag v-if="meal.data_source" :color="meal.data_source === 'baidu' ? 'green' : meal.data_source === 'unavailable' ? 'orange' : 'default'">
+                          {{ meal.data_source === 'baidu' ? '百度实查' : meal.data_source === 'unavailable' ? '暂无实查结果' : meal.data_source === 'mock' ? '模拟数据' : '历史模型建议' }}
+                        </a-tag>
                         <a-rate
                           v-if="meal.rating"
                           :value="meal.rating"
@@ -263,6 +287,12 @@ const tripPlanStore = useTripPlanStore()
 const { currentPlan: tripPlan, error, loading } = storeToRefs(tripPlanStore)
 const editMode = computed(() => tripPlanStore.planStatus === 'editing')
 const activeSection = ref('overview')
+const brokenImageUrls = ref(new Set<string>())
+
+function markImageBroken(url?: string): void {
+  if (!url) return
+  brokenImageUrls.value = new Set([...brokenImageUrls.value, url])
+}
 const sectionIds = ['overview', 'budget', 'map', 'itinerary', 'weather'] as const
 const routePlanId = computed(() => {
   const value = route.params.planId

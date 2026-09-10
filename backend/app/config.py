@@ -5,6 +5,9 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PlannerBackendName = Literal["pydantic_ai", "openai_tools", "deterministic"]
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -38,16 +41,25 @@ class Settings(BaseSettings):
     )
     amap_enrich_detail_limit: int = Field(default=3, ge=0, alias="AMAP_ENRICH_DETAIL_LIMIT")
     baidu_map_api_key: str = Field(default="", alias="BAIDU_MAP_API_KEY")
+    baidu_qps_budget: float = Field(default=2.0, ge=0.0, alias="BAIDU_QPS_BUDGET")
+    baidu_qps_retry_attempts: int = Field(default=2, ge=0, alias="BAIDU_QPS_RETRY_ATTEMPTS")
+    baidu_qps_retry_delay_seconds: float = Field(
+        default=0.5,
+        ge=0.0,
+        alias="BAIDU_QPS_RETRY_DELAY_SECONDS",
+    )
+    baidu_meal_concurrency: int = Field(default=2, ge=1, le=20, alias="BAIDU_MEAL_CONCURRENCY")
     unsplash_access_key: str = Field(default="", alias="UNSPLASH_ACCESS_KEY")
     enable_external_services: bool = Field(default=True, alias="ENABLE_EXTERNAL_SERVICES")
-    use_enhanced_prompt: bool = Field(default=True, alias="USE_ENHANCED_PROMPT")
-    enable_llm_tool_planning: bool = Field(default=True, alias="ENABLE_LLM_TOOL_PLANNING")
-    enable_pydantic_ai_planner: bool = Field(default=False, alias="ENABLE_PYDANTIC_AI_PLANNER")
+    planner_backend: PlannerBackendName = Field(
+        default="pydantic_ai",
+        alias="PLANNER_BACKEND",
+    )
     pydantic_ai_request_limit: int = Field(default=12, ge=2, alias="PYDANTIC_AI_REQUEST_LIMIT")
     pydantic_ai_tool_call_limit: int = Field(default=8, ge=1, alias="PYDANTIC_AI_TOOL_CALL_LIMIT")
     pydantic_ai_tool_round_limit: int = Field(default=3, ge=1, alias="PYDANTIC_AI_TOOL_ROUND_LIMIT")
     enable_plan_critique: bool = Field(default=True, alias="ENABLE_PLAN_CRITIQUE")
-    max_refinement_rounds: int = Field(default=3, ge=0, alias="MAX_REFINEMENT_ROUNDS")
+    max_refinement_rounds: int = Field(default=1, ge=0, alias="MAX_REFINEMENT_ROUNDS")
     min_pass_score: float = Field(default=7.0, ge=0, le=10, alias="MIN_PASS_SCORE")
     frontend_origin: str = Field(default="http://localhost:5173", alias="FRONTEND_ORIGIN")
     database_url: str = Field(
@@ -58,6 +70,49 @@ class Settings(BaseSettings):
     task_result_ttl_days: int = Field(default=30, ge=1, alias="TASK_RESULT_TTL_DAYS")
     task_worker_timeout_seconds: int = Field(default=900, ge=30, alias="TASK_WORKER_TIMEOUT_SECONDS")
     task_sse_timeout_seconds: int = Field(default=300, ge=30, alias="TASK_SSE_TIMEOUT_SECONDS")
+    trip_planner_attempt_timeout_seconds: float = Field(
+        default=150.0,
+        ge=10.0,
+        alias="TRIP_PLANNER_ATTEMPT_TIMEOUT_SECONDS",
+    )
+    trip_planner_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        alias="TRIP_PLANNER_MAX_ATTEMPTS",
+    )
+    planner_draft_timeout_seconds: float = Field(
+        default=90.0,
+        ge=0.0,
+        alias="PLANNER_DRAFT_TIMEOUT_SECONDS",
+    )
+    planner_draft_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        alias="PLANNER_DRAFT_MAX_ATTEMPTS",
+    )
+    planner_critique_timeout_seconds: float = Field(
+        default=35.0,
+        ge=0.0,
+        alias="PLANNER_CRITIQUE_TIMEOUT_SECONDS",
+    )
+    planner_refine_timeout_seconds: float = Field(
+        default=55.0,
+        ge=0.0,
+        alias="PLANNER_REFINE_TIMEOUT_SECONDS",
+    )
+    planner_global_request_limit: int = Field(
+        default=4,
+        ge=2,
+        le=12,
+        alias="PLANNER_GLOBAL_REQUEST_LIMIT",
+    )
+    pydantic_ai_model_request_timeout_seconds: float = Field(
+        default=90.0,
+        ge=0.0,
+        alias="PYDANTIC_AI_MODEL_REQUEST_TIMEOUT_SECONDS",
+    )
     task_maintenance_interval_seconds: int = Field(
         default=60,
         ge=10,
@@ -68,18 +123,14 @@ class Settings(BaseSettings):
         ge=60,
         alias="TASK_STALE_QUEUED_SECONDS",
     )
-    orchestration_backend: Literal["legacy", "langgraph"] = Field(
-        default="legacy",
-        alias="ORCHESTRATION_BACKEND",
-    )
     langgraph_checkpoint_dsn: str | None = Field(default=None, alias="LANGGRAPH_CHECKPOINT_DSN")
     langgraph_workflow_version: str = Field(
-        default="trip_planning_v1",
+        default="trip_planning_v2",
         min_length=1,
         alias="LANGGRAPH_WORKFLOW_VERSION",
     )
     langgraph_state_schema_version: int = Field(
-        default=1,
+        default=2,
         ge=1,
         alias="LANGGRAPH_STATE_SCHEMA_VERSION",
     )

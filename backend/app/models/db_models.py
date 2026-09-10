@@ -52,10 +52,6 @@ class TripPlanTask(Base):
         ),
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_trip_plan_tasks_progress"),
         CheckConstraint(
-            "orchestration_backend IN ('legacy','langgraph')",
-            name="ck_trip_plan_tasks_backend",
-        ),
-        CheckConstraint(
             "recovery_state IN ('none','pending','queued')",
             name="ck_trip_plan_tasks_recovery_state",
         ),
@@ -65,7 +61,6 @@ class TripPlanTask(Base):
         Index(
             "idx_trip_plan_tasks_recovery",
             "status",
-            "orchestration_backend",
             "heartbeat_at",
         ),
     )
@@ -94,19 +89,13 @@ class TripPlanTask(Base):
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_owner: Mapped[str | None] = mapped_column(String(128))
-    orchestration_backend: Mapped[str] = mapped_column(
-        String(16),
-        nullable=False,
-        default="legacy",
-        server_default=text("'legacy'"),
-    )
     workflow_version: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        default="legacy_v1",
-        server_default=text("'legacy_v1'"),
+        default="trip_planning_v2",
+        server_default=text("'trip_planning_v2'"),
     )
-    state_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    state_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2, server_default=text("2"))
     recovery_state: Mapped[str] = mapped_column(
         String(16),
         nullable=False,

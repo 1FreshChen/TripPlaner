@@ -26,14 +26,17 @@ PHASE_RANK = {
     "queued": 0,
     "preparing": 1,
     "collecting_context": 2,
-    "llm_planning": 3,
-    "meal_enrichment": 4,
-    "validating": 5,
-    "saving": 6,
-    "completed": 7,
-    "failed": 7,
-    "cancelled": 7,
-    "expired": 7,
+    "draft_planning": 3,
+    "critiquing": 4,
+    "refining": 5,
+    "llm_planning": 6,
+    "meal_enrichment": 7,
+    "validating": 8,
+    "saving": 9,
+    "completed": 10,
+    "failed": 10,
+    "cancelled": 10,
+    "expired": 10,
 }
 
 
@@ -105,12 +108,7 @@ class TripPlanTaskService:
             phase_started_at=now,
             updated_at=now,
             expires_at=now + timedelta(days=settings.task_result_ttl_days),
-            orchestration_backend=settings.orchestration_backend,
-            workflow_version=(
-                settings.langgraph_workflow_version
-                if settings.orchestration_backend == "langgraph"
-                else "legacy_v1"
-            ),
+            workflow_version=settings.langgraph_workflow_version,
             state_schema_version=settings.langgraph_state_schema_version,
             recovery_state="none",
         )
@@ -218,7 +216,6 @@ async def cleanup_expired_tasks(
                     TripPlanTask.expires_at.is_not(None),
                     TripPlanTask.expires_at < now,
                     TripPlanTask.status.not_in(TERMINAL_TASK_STATUSES),
-                    TripPlanTask.orchestration_backend == "legacy",
                 )
                 .with_for_update(skip_locked=True)
             )
@@ -240,11 +237,11 @@ async def cleanup_expired_tasks(
         return len(tasks)
 
 
-async def expire_langgraph_tasks(
+async def expire_workflow_tasks(
     session_factory: async_sessionmaker[AsyncSession],
     now: datetime | None = None,
 ) -> list[str]:
-    """Expire due LangGraph tasks and claim checkpoint threads that still need deletion."""
+    """Expire due workflow tasks and claim checkpoint threads that need deletion."""
     now = now or utc_now()
     async with session_factory() as db:
         tasks = (
@@ -253,7 +250,6 @@ async def expire_langgraph_tasks(
                 .where(
                     TripPlanTask.expires_at.is_not(None),
                     TripPlanTask.expires_at < now,
-                    TripPlanTask.orchestration_backend == "langgraph",
                     TripPlanTask.checkpoint_deleted_at.is_(None),
                 )
                 .with_for_update(skip_locked=True)
@@ -331,43 +327,6 @@ async def recover_stale_queued_tasks(
         return len(tasks)
 
 
-async def recover_stale_running_tasks(
-    session_factory: async_sessionmaker[AsyncSession],
-    stale_threshold_seconds: int,
-    now: datetime | None = None,
-) -> int:
-    """Fail running tasks that stopped reporting progress beyond the worker deadline."""
-    now = now or utc_now()
-    threshold = now - timedelta(seconds=stale_threshold_seconds)
-    async with session_factory() as db:
-        tasks = (
-            await db.scalars(
-                select(TripPlanTask)
-                .where(
-                    TripPlanTask.status == "running",
-                    TripPlanTask.updated_at < threshold,
-                    TripPlanTask.orchestration_backend == "legacy",
-                )
-                .with_for_update(skip_locked=True)
-            )
-        ).all()
-        for task in tasks:
-            transition_task(
-                task,
-                status="failed",
-                phase="failed",
-                progress=task.progress or 0,
-                message="任务执行超时",
-                now=now,
-            )
-            task.finished_at = now
-            task.error_code = "WORKER_LOST"
-            task.error_message = "Worker 长时间未上报进度，请重新提交任务"
-        if tasks:
-            await db.commit()
-        return len(tasks)
-
-
 async def update_task_progress(
     session_factory: async_sessionmaker[AsyncSession],
     task_id: str,
@@ -402,7 +361,15 @@ def progress_from_graph_state(state: dict[str, Any]) -> tuple[str, int, str]:
     phase = "collecting_context"
     progress = 10 + (25 * collectors // 3)
     message = f"已完成信息采集 {collectors}/3"
-    if "trip_planner" in state:
+    if collectors == 3:
+        phase, progress, message = "draft_planning", 40, "信息采集完成，正在生成行程草案"
+    if state.get("planner_draft_ready"):
+        phase, progress, message = "critiquing", 60, "行程草案已保存，正在进行质量审查"
+    if state.get("plan_critique_status") == "needs_revision":
+        phase, progress, message = "refining", 68, "质量审查完成，正在按建议修订"
+    if state.get("planner_finalized"):
+        phase, progress, message = "llm_planning", 75, "行程规划已定稿"
+    elif "trip_planner" in state and not state.get("planner_draft_ready"):
         phase, progress, message = "llm_planning", 75, "每日行程已生成"
     if "meal_enriched" in state:
         phase, progress, message = "meal_enrichment", 90, "餐饮信息处理完成"
@@ -412,6 +379,48 @@ def progress_from_graph_state(state: dict[str, Any]) -> tuple[str, int, str]:
     ):
         phase, progress, message = "validating", 95, "行程质量校验完成"
     return phase, progress, message
+
+
+def active_phase_progress(
+    phase: str,
+    elapsed_seconds: float,
+    *,
+    planner_attempt_timeout_seconds: float,
+    planner_max_attempts: int,
+    critique_timeout_seconds: float = 35.0,
+    refine_timeout_seconds: float = 55.0,
+) -> tuple[int, str] | None:
+    """Project honest in-flight progress without crossing a completion boundary."""
+    boundaries = {
+        "draft_planning": (40, 59, planner_attempt_timeout_seconds * planner_max_attempts, "正在生成行程草案"),
+        "critiquing": (60, 67, critique_timeout_seconds, "正在审查行程草案"),
+        "refining": (68, 74, refine_timeout_seconds, "正在按审查建议修订行程"),
+        # Keep compatibility with tasks created by workflow v1.
+        "llm_planning": (
+            40,
+            74,
+            planner_attempt_timeout_seconds * planner_max_attempts,
+            "正在生成每日行程",
+        ),
+    }
+    if phase not in boundaries:
+        return None
+    start, end, phase_budget, label = boundaries[phase]
+    timeout_disabled = (
+        (phase == "draft_planning" and planner_attempt_timeout_seconds <= 0)
+        or (phase == "critiquing" and critique_timeout_seconds <= 0)
+        or (phase == "refining" and refine_timeout_seconds <= 0)
+    )
+    if timeout_disabled:
+        elapsed_display = int(max(elapsed_seconds, 0.0))
+        return start, f"{label}，已等待 {elapsed_display} 秒；当前诊断运行未设置此阶段硬超时"
+    retry_delays = max(planner_max_attempts - 1, 0) * 2.0 if phase in {"draft_planning", "llm_planning"} else 0.0
+    total_budget = max(phase_budget + retry_delays, 1.0)
+    bounded_elapsed = min(max(elapsed_seconds, 0.0), total_budget)
+    progress = min(end, start + int((end - start) * bounded_elapsed / total_budget))
+    elapsed_display = int(max(elapsed_seconds, 0.0))
+    suffix = "；超时会重试草案生成" if phase in {"draft_planning", "llm_planning"} else "；超时将保留已有草案"
+    return progress, f"{label}，已等待 {elapsed_display} 秒{suffix}"
 
 
 async def reconcile_task_progress(
@@ -472,17 +481,40 @@ async def refresh_task_heartbeat(
 ) -> bool:
     now = utc_now()
     async with session_factory() as db:
-        result = await db.execute(
-            update(TripPlanTask)
+        task = await db.scalar(
+            select(TripPlanTask)
             .where(
                 TripPlanTask.task_id == task_id,
                 TripPlanTask.lease_owner == lease_owner,
                 TripPlanTask.status == "running",
             )
-            .values(heartbeat_at=now)
+            .with_for_update()
         )
+        if task is None:
+            return False
+        task.heartbeat_at = now
+        if task.phase_started_at is not None:
+            settings = get_settings()
+            projection = active_phase_progress(
+                task.phase,
+                (now - task.phase_started_at).total_seconds(),
+                planner_attempt_timeout_seconds=settings.planner_draft_timeout_seconds,
+                planner_max_attempts=settings.planner_draft_max_attempts,
+                critique_timeout_seconds=settings.planner_critique_timeout_seconds,
+                refine_timeout_seconds=settings.planner_refine_timeout_seconds,
+            )
+            if projection is not None:
+                progress, message = projection
+                transition_task(
+                    task,
+                    status="running",
+                    phase=task.phase,
+                    progress=progress,
+                    message=message,
+                    now=now,
+                )
         await db.commit()
-        return bool(result.rowcount)
+        return True
 
 
 async def mark_task_recovery_pending(
@@ -534,7 +566,6 @@ async def claim_recovery_candidates(
                 select(TripPlanTask)
                 .where(
                     TripPlanTask.status == "running",
-                    TripPlanTask.orchestration_backend == "langgraph",
                     or_(
                         and_(
                             TripPlanTask.recovery_state == "none",

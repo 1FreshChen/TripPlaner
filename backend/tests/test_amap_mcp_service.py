@@ -9,6 +9,7 @@ from hello_agents.tools import MCPTool
 from app.agents.trip_planner import TripPlannerAgent
 from app.config import get_settings
 from app.services import amap_mcp_service
+from app.services.amap_service import AmapService
 from app.services.amap_mcp_service import AmapMCPService, _PersistentMCPConnection
 from app.tools.bootstrap import bootstrap_tools
 
@@ -129,6 +130,7 @@ def test_amap_mcp_service_reuses_connection_and_normalizes_results():
             "biz_ext": {"rating": "4.8"},
             "location": "116.397128,39.916527",
             "type": "museum",
+            "_source": "amap_mcp",
         }
     ]
     assert [call[0] for call in connection.calls] == [
@@ -402,6 +404,49 @@ def test_mcp_enrichment_is_capped_by_config(monkeypatch):
     result = service.search_pois("museum", "TestCity", offset=5)
 
     assert not result.is_error
-    assert len(result.data) == 4
+    assert len(result.data) == 2
     detail_calls = [call for call in service._connection.calls if call[0] == "maps_search_detail"]
     assert len(detail_calls) == 2
+
+
+def test_zero_detail_limit_disables_detail_calls(monkeypatch):
+    monkeypatch.setenv("AMAP_ENRICH_DETAIL_LIMIT", "0")
+    get_settings.cache_clear()
+    connection = FakeConnection()
+    service = build_service(connection)
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert all(call[0] != "maps_search_detail" for call in connection.calls)
+
+
+def test_mcp_detail_failure_uses_http_detail_fallback(monkeypatch):
+    class DetailFailingConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            if tool_name == "maps_search_detail":
+                raise TimeoutError("detail timeout")
+            return super().call_tool(tool_name, arguments)
+
+    service = AmapMCPService(
+        api_key="test-key",
+        server_command=["fake-server"],
+        http_fallback=True,
+        connection=DetailFailingConnection(),
+    )
+    monkeypatch.setattr(
+        AmapService,
+        "get_poi_detail",
+        lambda self, poi_id: {
+            "id": poi_id,
+            "location": "116.397128,39.916527",
+            "photos": [{"url": "https://example.test/museum.jpg"}],
+            "_source": "amap_http",
+        },
+    )
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert result.data[0]["location"] == "116.397128,39.916527"
+    assert result.data[0]["_source"] == "amap_http"

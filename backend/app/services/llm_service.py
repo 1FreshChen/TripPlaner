@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -77,6 +78,48 @@ class LLMService:
             return json.loads(content)
         except Exception as exc:
             logger.warning("LLM JSON generation failed, fallback will be used: %s", exc)
+            return None
+
+    async def generate_json_async(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        timeout_seconds: float | None = 60.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Cancelable JSON generation for bounded orchestration stages."""
+        if not self.enabled:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.4,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                return json.loads(content)
+        except asyncio.CancelledError:
+            raise
+        except httpx.TimeoutException as exc:
+            timeout_label = f"{timeout_seconds:.1f}s" if timeout_seconds is not None else "provider timeout"
+            raise TimeoutError(
+                f"LLM JSON request timed out after {timeout_label}"
+            ) from exc
+        except Exception as exc:
+            logger.warning("Async LLM JSON generation failed: %s", exc)
             return None
 
     async def chat_with_tools(

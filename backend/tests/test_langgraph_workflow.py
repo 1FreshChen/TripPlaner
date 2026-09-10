@@ -9,14 +9,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agents.trip_planner import PlannerAgent
 from app.config import Settings
-from app.models.schemas import TripPlanRequest
+from app.models.schemas import CritiqueResult, CritiqueScores, TripPlanRequest
 from app.orchestration.base import AgentDefinition, RetryPolicy
 from app.orchestration.checkpoint import postgres_checkpoint_dsn
 from app.orchestration.langgraph_workflow import build_trip_planning_graph
 from app.orchestration.registry import AgentRegistry
 from app.services.mock_data import build_mock_attractions, build_mock_hotels, build_mock_weather
-from app.services import task_service
+from app.services import planning_workflow_service, task_service
+from app.services.planning_workflow_service import PlanningWorkflowService
 from app.services.task_service import TripPlanTaskService, progress_from_graph_state, transition_task
+from app.services.task_service import active_phase_progress
 from app.models.db_models import TripPlanTask
 from app.services import state_service
 from app.services.state_service import StateService
@@ -75,10 +77,51 @@ class _PlannerAgent:
 
     async def execute(self, context):
         self._calls["planner"] = self._calls.get("planner", 0) + 1
-        plan = await PlannerAgent(use_llm=False).execute(context)
+        plan = await PlannerAgent().execute(context)
         if self._invalid:
             plan.days.pop()
         return plan
+
+
+class _TimeoutOncePlannerAgent:
+    def __init__(self, calls: dict[str, int]):
+        self._calls = calls
+
+    async def execute(self, context):
+        self._calls["planner"] = self._calls.get("planner", 0) + 1
+        if self._calls["planner"] == 1:
+            await asyncio.sleep(0.08)
+        return await PlannerAgent().execute(context)
+
+
+class _StagedPlannerAgent:
+    enable_critique = True
+    max_refinement_rounds = 1
+    min_pass_score = 7.0
+    llm_service = object()
+
+    def __init__(
+        self,
+        calls: dict[str, int],
+        *,
+        fail_refine: bool = False,
+        refine_delay: float = 0,
+    ):
+        self._calls = calls
+        self._fail_refine = fail_refine
+        self._refine_delay = refine_delay
+
+    async def execute(self, context):
+        self._calls["planner"] = self._calls.get("planner", 0) + 1
+        return await PlannerAgent().execute(context)
+
+    async def refine_once(self, _context, previous_plan, _critique):
+        self._calls["refine"] = self._calls.get("refine", 0) + 1
+        if self._refine_delay:
+            await asyncio.sleep(self._refine_delay)
+        if self._fail_refine:
+            raise TimeoutError("refine timeout")
+        return previous_plan
 
 
 class _FailingAttractionAgent:
@@ -90,7 +133,15 @@ class _FailingAttractionAgent:
         raise ConnectionError("temporary attraction failure")
 
 
-def _registry(calls: dict[str, int], *, fail_attraction: bool = False, invalid_plan: bool = False):
+def _registry(
+    calls: dict[str, int],
+    *,
+    fail_attraction: bool = False,
+    invalid_plan: bool = False,
+    planner_factory=None,
+    planner_attempts: int = 1,
+    planner_timeout: float = 5,
+):
     registry = AgentRegistry()
     registry.register(
         AgentDefinition(
@@ -119,10 +170,9 @@ def _registry(calls: dict[str, int], *, fail_attraction: bool = False, invalid_p
     registry.register(
         AgentDefinition(
             name="trip_planner",
-            agent_class=lambda: _PlannerAgent(calls, invalid=invalid_plan),
-            depends_on=["attraction_search", "weather_query", "hotel_recommendation"],
-            retry_policy=RetryPolicy(max_attempts=1, base_delay=0),
-            timeout_seconds=5,
+            agent_class=planner_factory or (lambda: _PlannerAgent(calls, invalid=invalid_plan)),
+            retry_policy=RetryPolicy(max_attempts=planner_attempts, base_delay=0),
+            timeout_seconds=planner_timeout,
         )
     )
     return registry
@@ -134,6 +184,9 @@ def _settings() -> Settings:
         LLM_API_KEY="",
         BAIDU_MAP_API_KEY="",
         LANGGRAPH_MEAL_TIMEOUT_SECONDS=5,
+        PLANNER_DRAFT_TIMEOUT_SECONDS=90,
+        PLANNER_CRITIQUE_TIMEOUT_SECONDS=35,
+        PLANNER_REFINE_TIMEOUT_SECONDS=55,
     )
 
 
@@ -145,16 +198,34 @@ def test_checkpoint_dsn_reuses_database_url_with_psycopg_driver():
     assert postgres_checkpoint_dsn(settings) == "postgresql://user:p%40ss@db:5432/trips"
 
 
-def test_graph_completed_checkpoint_does_not_run_planner_twice():
+def test_graph_completed_checkpoint_does_not_run_planner_twice(monkeypatch):
     calls: dict[str, int] = {}
     graph = build_trip_planning_graph(
         InMemorySaver(),
         registry=_registry(calls),
         settings=_settings(),
     )
-    config = {"configurable": {"thread_id": "resume-task", "checkpoint_ns": "trip_planning_v1"}}
+    config = {"configurable": {"thread_id": "resume-task"}}
     first = asyncio.run(graph.ainvoke(_initial_state(_request(), "resume-task"), config))
-    second = asyncio.run(graph.ainvoke(None, config))
+
+    async def ignore_progress(*_args, **_kwargs):
+        return None
+
+    async def finish(_task_id, _lease_owner, _plan_id, values):
+        return values
+
+    monkeypatch.setattr(planning_workflow_service, "reconcile_task_progress", ignore_progress)
+    service = PlanningWorkflowService(None, graph)
+    monkeypatch.setattr(service, "_finish", finish)
+    second = asyncio.run(
+        service.run(
+            task_id="resume-task",
+            lease_owner="test-worker",
+            request_payload=_request().model_dump(mode="json"),
+            workflow_version="trip_planning_v1",
+            state_schema_version=1,
+        )
+    )
 
     assert first["validation_passed"] is True
     assert second["validation_passed"] is True
@@ -171,6 +242,54 @@ def test_collector_retries_then_uses_existing_fallback_and_reaches_planner():
     )
     assert calls["attraction"] == 2
     assert attraction_result["fallback_used"] == "mock"
+    assert result["validation_passed"] is True
+    assert calls["planner"] == 1
+
+
+def test_planner_timeout_is_retried_and_attempt_diagnostics_are_preserved():
+    calls: dict[str, int] = {}
+    graph = build_trip_planning_graph(
+        registry=_registry(
+            calls,
+            planner_factory=lambda: _TimeoutOncePlannerAgent(calls),
+            planner_attempts=2,
+            planner_timeout=0.05,
+        ),
+        settings=_settings(),
+    )
+
+    result = asyncio.run(graph.ainvoke(_initial_state(_request())))
+    planner_result = next(
+        item for item in result["agent_results"] if item["agent_name"] == "trip_planner"
+    )
+
+    assert calls["planner"] == 2
+    assert planner_result["attempt"] == 2
+    assert planner_result["fallback_used"] is None
+    assert planner_result["error_type"] == "TimeoutError"
+    assert planner_result["error_message"] == "TimeoutError"
+    assert [item["status"] for item in planner_result["attempt_history"]] == [
+        "failed",
+        "completed",
+    ]
+
+
+def test_zero_draft_timeout_disables_outer_planner_cutoff():
+    calls: dict[str, int] = {}
+    settings = _settings()
+    settings.planner_draft_timeout_seconds = 0
+    graph = build_trip_planning_graph(
+        registry=_registry(
+            calls,
+            planner_factory=lambda: _TimeoutOncePlannerAgent(calls),
+            planner_attempts=2,
+            planner_timeout=0.01,
+        ),
+        settings=settings,
+    )
+
+    result = asyncio.run(graph.ainvoke(_initial_state(_request())))
+
     assert result["validation_passed"] is True
     assert calls["planner"] == 1
 
@@ -193,6 +312,106 @@ def test_meal_failure_preserves_original_plan_and_continues_validation(monkeypat
         and item["fallback_used"] == "preserve_original_plan"
         for item in result["agent_results"]
     )
+
+
+def test_critique_failure_preserves_checkpointed_draft(monkeypatch):
+    from app.orchestration import langgraph_workflow
+
+    async def fail_critique(*_args, **_kwargs):
+        raise TimeoutError("critic timeout")
+
+    monkeypatch.setattr(langgraph_workflow.PlanCritic, "evaluate", fail_critique)
+    calls: dict[str, int] = {}
+    graph = build_trip_planning_graph(
+        registry=_registry(calls, planner_factory=lambda: _StagedPlannerAgent(calls)),
+        settings=_settings(),
+    )
+    result = asyncio.run(graph.ainvoke(_initial_state(_request())))
+
+    assert result["validation_passed"] is True
+    assert result["planner_draft_ready"] is True
+    assert result["plan_critique_status"] == "unavailable_preserved"
+    assert any(
+        item["agent_name"] == "trip_planner_critique"
+        and item["fallback_used"] == "preserve_valid_draft"
+        for item in result["agent_results"]
+    )
+
+
+def test_refine_failure_preserves_checkpointed_draft(monkeypatch):
+    from app.orchestration import langgraph_workflow
+
+    async def request_revision(*_args, **_kwargs):
+        return CritiqueResult(
+            scores=CritiqueScores(
+                attraction_diversity=6,
+                description_quality=6,
+                weather_compatibility=6,
+                schedule_feasibility=6,
+                budget_realism=6,
+            ),
+            issues=[],
+            suggestions=["调整安排"],
+            needs_revision=True,
+            revision_summary="需要修订",
+        )
+
+    monkeypatch.setattr(langgraph_workflow.PlanCritic, "evaluate", request_revision)
+    calls: dict[str, int] = {}
+    graph = build_trip_planning_graph(
+        registry=_registry(
+            calls,
+            planner_factory=lambda: _StagedPlannerAgent(calls, fail_refine=True),
+        ),
+        settings=_settings(),
+    )
+    result = asyncio.run(graph.ainvoke(_initial_state(_request())))
+
+    assert calls["refine"] == 1
+    assert result["validation_passed"] is True
+    assert result["plan_critique_status"] == "refinement_failed_preserved"
+    assert any(
+        item["agent_name"] == "trip_planner_refine"
+        and item["fallback_used"] == "preserve_valid_draft"
+        for item in result["agent_results"]
+    )
+
+
+def test_zero_refine_timeout_waits_for_natural_completion(monkeypatch):
+    from app.orchestration import langgraph_workflow
+
+    async def request_revision(*_args, **_kwargs):
+        return CritiqueResult(
+            scores=CritiqueScores(
+                attraction_diversity=6,
+                description_quality=6,
+                weather_compatibility=6,
+                schedule_feasibility=6,
+                budget_realism=6,
+            ),
+            issues=[],
+            suggestions=["调整安排"],
+            needs_revision=True,
+            revision_summary="需要修订",
+        )
+
+    monkeypatch.setattr(langgraph_workflow.PlanCritic, "evaluate", request_revision)
+    calls: dict[str, int] = {}
+    settings = _settings()
+    settings.planner_refine_timeout_seconds = 0
+    graph = build_trip_planning_graph(
+        registry=_registry(
+            calls,
+            planner_factory=lambda: _StagedPlannerAgent(calls, refine_delay=0.03),
+        ),
+        settings=settings,
+    )
+
+    result = asyncio.run(graph.ainvoke(_initial_state(_request())))
+
+    assert result["validation_passed"] is True
+    assert result["plan_critique_status"] == "refined"
+    assert calls["refine"] == 1
 
 
 def test_validate_failure_becomes_serializable_terminal_error():
@@ -224,7 +443,59 @@ def test_progress_projection_is_order_independent_and_monotonic():
         {"trip_planner": {}, "meal_enriched": True, "validation_passed": True},
     ]
     projections = [progress_from_graph_state(state) for state in states]
-    assert [progress for _phase, progress, _message in projections] == [10, 18, 26, 35, 75, 90, 95]
+    assert [progress for _phase, progress, _message in projections] == [10, 18, 26, 40, 75, 90, 95]
+    assert projections[3][0] == "draft_planning"
+
+
+def test_progress_projection_exposes_checkpointed_planner_subphases():
+    states = [
+        {"attraction_search": [], "weather_query": [], "hotel_recommendation": []},
+        {"planner_draft_ready": True, "trip_planner": {}},
+        {
+            "planner_draft_ready": True,
+            "trip_planner": {},
+            "plan_critique_status": "needs_revision",
+        },
+        {"planner_draft_ready": True, "trip_planner": {}, "planner_finalized": True},
+    ]
+    projections = [progress_from_graph_state(state) for state in states]
+    assert [(phase, progress) for phase, progress, _message in projections] == [
+        ("draft_planning", 40),
+        ("critiquing", 60),
+        ("refining", 68),
+        ("llm_planning", 75),
+    ]
+
+
+def test_active_planner_progress_moves_with_elapsed_time_without_claiming_completion():
+    start = active_phase_progress(
+        "llm_planning",
+        0,
+        planner_attempt_timeout_seconds=150,
+        planner_max_attempts=2,
+    )
+    middle = active_phase_progress(
+        "llm_planning",
+        151,
+        planner_attempt_timeout_seconds=150,
+        planner_max_attempts=2,
+    )
+    exhausted = active_phase_progress(
+        "llm_planning",
+        999,
+        planner_attempt_timeout_seconds=150,
+        planner_max_attempts=2,
+    )
+
+    assert start is not None and start[0] == 40
+    assert middle is not None and 40 < middle[0] < 74
+    assert exhausted is not None and exhausted[0] == 74
+    assert active_phase_progress(
+        "meal_enrichment",
+        30,
+        planner_attempt_timeout_seconds=150,
+        planner_max_attempts=2,
+    ) is None
 
 
 def test_task_progress_does_not_regress_when_late_events_arrive():
@@ -254,9 +525,8 @@ def test_task_progress_does_not_regress_when_late_events_arrive():
     assert task.message == "餐饮信息处理完成"
 
 
-def test_task_creation_snapshots_langgraph_backend_and_versions(monkeypatch):
+def test_task_creation_snapshots_workflow_versions(monkeypatch):
     settings = Settings(
-        ORCHESTRATION_BACKEND="langgraph",
         LANGGRAPH_WORKFLOW_VERSION="trip_planning_v1",
         LANGGRAPH_STATE_SCHEMA_VERSION=3,
     )
@@ -281,7 +551,6 @@ def test_task_creation_snapshots_langgraph_backend_and_versions(monkeypatch):
     created = db.added[0]
 
     assert response.status == "queued"
-    assert created.orchestration_backend == "langgraph"
     assert created.workflow_version == "trip_planning_v1"
     assert created.state_schema_version == 3
     assert created.result_plan_id is None
@@ -303,7 +572,6 @@ def test_prepare_reuses_the_task_plan_id_and_failure_terminates_both_rows(monkey
         phase_timings={},
         result_plan_id=None,
         retry_count=0,
-        orchestration_backend="langgraph",
         workflow_version="trip_planning_v1",
         state_schema_version=1,
         recovery_state="none",

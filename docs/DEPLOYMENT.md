@@ -28,19 +28,19 @@
 
 数据库迁移可能不是可逆的，因此发布迁移必须保持向后兼容；重大迁移前先做备份。
 
-### LangGraph 状态机灰度启用
+### 统一 LangGraph 工作流升级
 
-新编排默认保持 `ORCHESTRATION_BACKEND=legacy`。启用前先部署代码并执行 Alembic `003_langgraph_state_machine`，确认 API 与 Worker 使用同一套版本配置，再同时设置：
+从 Alembic `004_unified_langgraph_workflow` 开始，后台任务只通过 LangGraph 执行，不再提供 legacy 运行时开关。部署时必须先停止旧 Worker、备份数据库并执行迁移，再启动同一版本的 API 与 Worker。Planner 节点通过一个配置选择实现：
 
 ```dotenv
-ORCHESTRATION_BACKEND=langgraph
-LANGGRAPH_WORKFLOW_VERSION=trip_planning_v1
-LANGGRAPH_STATE_SCHEMA_VERSION=1
+PLANNER_BACKEND=pydantic_ai
+LANGGRAPH_WORKFLOW_VERSION=trip_planning_v2
+LANGGRAPH_STATE_SCHEMA_VERSION=2
 ```
 
-`LANGGRAPH_CHECKPOINT_DSN` 可留空，Worker 会从 `DATABASE_URL` 派生 psycopg DSN。切回 legacy 只影响新建任务；已经按 langgraph 创建的非终态任务仍需由带 checkpoint runtime 的 Worker 排空后再下线，避免版本快照与执行器不一致。
+`PLANNER_BACKEND` 可取 `pydantic_ai`、`openai_tools` 或 `deterministic`；切换只改变 LangGraph 中的 Planner 节点，不改变任务状态机、恢复语义或持久化格式。`LANGGRAPH_CHECKPOINT_DSN` 可留空，Worker 会从 `DATABASE_URL` 派生 psycopg DSN。
 
-上线检查应覆盖 Worker 日志中的 checkpoint 初始化、独立 heartbeat、恢复 scanner，以及 `trip_plan_tasks` 的 `heartbeat_at/recovery_state/retry_count`。先用单 Worker 小流量验证，再逐步扩大；迁移本身保持 legacy 代码可读，因此配置回退不要求回滚数据库约束。
+迁移会把排队任务升级到当前工作流版本；没有 checkpoint 的运行中 legacy 任务会以 `WORKFLOW_UPGRADED` 结束，必须由调用方重新提交。上线检查应覆盖 checkpoint 初始化、独立 heartbeat、恢复 scanner，以及 `trip_plan_tasks` 的 `heartbeat_at/recovery_state/retry_count`。回退应用版本前必须确认数据库模式兼容，不能再依靠配置切回 legacy。
 
 ## GitHub 配置
 

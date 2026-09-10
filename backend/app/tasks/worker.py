@@ -9,30 +9,23 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 
 from arq.worker import func
-from sqlalchemy import select, text
+from sqlalchemy import text
 
 from app.config import get_settings
 from app.database import get_engine, get_session_factory
-from app.models.db_models import TripPlanTask
-from app.models.schemas import TripPlanRequest
 from app.orchestration.checkpoint import create_checkpoint_runtime
 from app.orchestration.langgraph_workflow import build_trip_planning_graph
 from app.services.amap_mcp_service import close_amap_mcp_service
 from app.services.planning_workflow_service import PlanningWorkflowService
 from app.services.state_service import StateService
 from app.services.task_service import (
-    TERMINAL_TASK_STATUSES,
     acquire_task_lease,
     claim_recovery_candidates,
-    expire_langgraph_tasks,
-    fail_task,
+    expire_workflow_tasks,
     mark_checkpoint_deleted,
     mark_recovery_enqueue_failed,
     mark_task_recovery_pending,
     refresh_task_heartbeat,
-    transition_task,
-    update_task_progress,
-    utc_now,
 )
 from app.tasks.queue import redis_settings_from_url
 
@@ -64,53 +57,6 @@ async def _postgres_advisory_lock(lock_key: int):
         finally:
             if acquired:
                 await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
-
-
-async def _run_legacy_task(task_id: str, request_payload: dict) -> str | None:
-    session_factory = get_session_factory()
-
-    async def report_progress(phase: str, progress: int, message: str) -> None:
-        await update_task_progress(session_factory, task_id, phase, progress, message)
-
-    async with session_factory() as db:
-        try:
-            result = await StateService(db).create_trip_plan(
-                TripPlanRequest.model_validate(request_payload),
-                progress_callback=report_progress,
-            )
-            task = await db.scalar(
-                select(TripPlanTask).where(TripPlanTask.task_id == task_id).with_for_update()
-            )
-            if task is None:
-                raise RuntimeError(f"Task {task_id} disappeared before completion")
-            if task.status in TERMINAL_TASK_STATUSES:
-                await db.rollback()
-                return None
-            now = utc_now()
-            transition_task(
-                task,
-                status="succeeded",
-                phase="completed",
-                progress=100,
-                message="行程规划已完成",
-                now=now,
-            )
-            task.result_plan_id = uuid.UUID(result.plan_id)
-            task.result_payload = result.model_dump(mode="json")
-            task.finished_at = now
-            task.error_code = None
-            task.error_message = None
-            await db.commit()
-            return result.plan_id
-        except asyncio.CancelledError:
-            await db.rollback()
-            with suppress(Exception):
-                await fail_task(session_factory, task_id, RuntimeError("Worker stopped before task completion"))
-            raise
-        except Exception as exc:
-            await db.rollback()
-            await fail_task(session_factory, task_id, exc)
-            raise
 
 
 async def _heartbeat_loop(task_id: str, lease_owner: str) -> None:
@@ -209,16 +155,7 @@ async def _run_langgraph_task(ctx: dict, task_id: str) -> str | None:
 
 
 async def generate_trip_plan_task(ctx: dict, task_id: str) -> str | None:
-    session_factory = get_session_factory()
-    async with session_factory() as lookup_db:
-        task = await lookup_db.scalar(select(TripPlanTask).where(TripPlanTask.task_id == task_id))
-        if task is None or task.status in TERMINAL_TASK_STATUSES:
-            return None
-        request_payload = dict(task.request_payload)
-        backend = task.orchestration_backend
-    if backend == "langgraph":
-        return await _run_langgraph_task(ctx, task_id)
-    return await _run_legacy_task(task_id, request_payload)
+    return await _run_langgraph_task(ctx, task_id)
 
 
 async def _scan_recoveries(ctx: dict) -> None:
@@ -227,7 +164,7 @@ async def _scan_recoveries(ctx: dict) -> None:
     async with _postgres_advisory_lock(SCANNER_LOCK_KEY) as acquired:
         if not acquired:
             return
-        expired_task_ids = await expire_langgraph_tasks(session_factory)
+        expired_task_ids = await expire_workflow_tasks(session_factory)
         saver = getattr(ctx.get("checkpoint_runtime"), "saver", None)
         if saver is not None:
             for expired_task_id in expired_task_ids:
@@ -292,8 +229,6 @@ async def _recovery_scanner_loop(ctx: dict) -> None:
 
 async def startup_worker(ctx: dict) -> None:
     settings = get_settings()
-    if settings.orchestration_backend != "langgraph":
-        return
     runtime = create_checkpoint_runtime(settings)
     saver = await runtime.start()
     ctx["checkpoint_runtime"] = runtime

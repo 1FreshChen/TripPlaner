@@ -31,7 +31,6 @@ from app.services.amap_mcp_service import close_amap_mcp_service
 from app.services.task_service import (
     cleanup_expired_tasks,
     recover_stale_queued_tasks,
-    recover_stale_running_tasks,
 )
 from app.tasks.queue import close_task_queue
 
@@ -50,19 +49,11 @@ async def _maintain_tasks() -> None:
                 session_factory,
                 stale_threshold_seconds=settings.task_stale_queued_seconds,
             )
-            legacy_running_failed = await recover_stale_running_tasks(
-                session_factory,
-                stale_threshold_seconds=(
-                    settings.task_worker_timeout_seconds
-                    + settings.task_maintenance_interval_seconds
-                ),
-            )
-            if expired or recovered or legacy_running_failed:
+            if expired or recovered:
                 logger.warning(
-                    "Task maintenance updated stale records: expired=%d enqueue_lost=%d legacy_worker_lost=%d",
+                    "Task maintenance updated stale records: expired=%d enqueue_lost=%d",
                     expired,
                     recovered,
-                    legacy_running_failed,
                 )
         except asyncio.CancelledError:
             raise

@@ -74,6 +74,8 @@ def build_mock_attractions(city: str, preferences: str, days: int) -> List[Attra
                 description=f"适合{preferences}偏好的{item['category']}目的地，建议结合周边餐饮和交通安排游览。",
                 category=item["category"],
                 rating=4.3 + (index % 5) * 0.1,
+                data_source="mock",
+                coordinate_verified=False,
                 ticket_price=item["price"],
             )
         )
@@ -143,7 +145,7 @@ def build_mock_meals(city: str, day_index: int, budget: str) -> List[Meal]:
 
     day_no = day_index + 1
     return [
-        Meal(type="breakfast", name=f"{city}本地早餐 第{day_no}天", description="选择酒店附近的本地早餐。", estimated_cost=breakfast),
-        Meal(type="lunch", name=f"{city}特色午餐 第{day_no}天", description="结合上午景点周边餐厅。", estimated_cost=lunch),
-        Meal(type="dinner", name=f"{city}风味晚餐 第{day_no}天", description="安排在交通便利的商圈。", estimated_cost=dinner),
+        Meal(type="breakfast", name=f"{city}本地早餐 第{day_no}天", description="选择酒店附近的本地早餐。", estimated_cost=breakfast, data_source="mock"),
+        Meal(type="lunch", name=f"{city}特色午餐 第{day_no}天", description="结合上午景点周边餐厅。", estimated_cost=lunch, data_source="mock"),
+        Meal(type="dinner", name=f"{city}风味晚餐 第{day_no}天", description="安排在交通便利的商圈。", estimated_cost=dinner, data_source="mock"),
     ]

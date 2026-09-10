@@ -13,7 +13,6 @@ from app.services.task_service import (
     TripPlanTaskService,
     cleanup_expired_tasks,
     recover_stale_queued_tasks,
-    recover_stale_running_tasks,
     transition_task,
 )
 from app.tasks import worker
@@ -130,81 +129,19 @@ def test_task_maintenance_expires_and_recovers_stale_tasks():
     assert stale.error_code == "ENQUEUE_LOST"
     assert stale.finished_at == now
 
-    running = _task(now - timedelta(minutes=20))
-    running.status = "running"
-    running.phase = "llm_planning"
-    running.updated_at = now - timedelta(minutes=20)
-    running_db = FakeMaintenanceDB([running])
+def test_worker_always_delegates_to_langgraph_runtime(monkeypatch):
+    calls = []
 
-    assert asyncio.run(
-        recover_stale_running_tasks(
-            FakeMaintenanceFactory(running_db),
-            stale_threshold_seconds=900,
-            now=now,
-        )
-    ) == 1
-    assert running.status == "failed"
-    assert running.error_code == "WORKER_LOST"
-    assert running.finished_at == now
+    async def fake_run(ctx, task_id):
+        calls.append((ctx, task_id))
+        return "plan-id"
 
+    monkeypatch.setattr(worker, "_run_langgraph_task", fake_run)
 
-def test_worker_does_not_overwrite_terminal_status_after_maintenance(monkeypatch):
-    now = datetime(2026, 7, 13, tzinfo=timezone.utc)
-    task = _task(now)
-    task.request_payload = {
-        "session_id": "11111111-1111-1111-1111-111111111111",
-        "city": "北京",
-        "start_date": "2026-07-13",
-        "end_date": "2026-07-13",
-        "days": 1,
-    }
+    result = asyncio.run(worker.generate_trip_plan_task({"runtime": True}, "task-id"))
 
-    class FakeDB:
-        def __init__(self):
-            self.rollback_calls = 0
-            self.commit_calls = 0
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def scalar(self, statement):
-            return task
-
-        async def rollback(self):
-            self.rollback_calls += 1
-
-        async def commit(self):
-            self.commit_calls += 1
-
-    class FakeFactory:
-        def __init__(self, db):
-            self.db = db
-
-        def __call__(self):
-            return self.db
-
-    class FakeStateService:
-        def __init__(self, db):
-            self.db = db
-
-        async def create_trip_plan(self, request, progress_callback=None):
-            task.status = "failed"
-            task.phase = "failed"
-            return SimpleNamespace(plan_id="22222222-2222-2222-2222-222222222222")
-
-    fake_db = FakeDB()
-    monkeypatch.setattr(worker, "get_session_factory", lambda: FakeFactory(fake_db))
-    monkeypatch.setattr(worker, "StateService", FakeStateService)
-
-    result = asyncio.run(worker.generate_trip_plan_task({}, task.task_id))
-
-    assert result is None
-    assert task.status == "failed"
-    assert fake_db.rollback_calls == 1
-    assert fake_db.commit_calls == 0
+    assert result == "plan-id"
+    assert calls == [({"runtime": True}, "task-id")]
 
 
 class CompletedTaskService:
