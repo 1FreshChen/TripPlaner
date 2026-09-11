@@ -18,7 +18,7 @@
     "html2canvas": "^1.4.1",
     "jspdf": "^4.2.1",
     "lucide-vue-next": "^0.468.0",
-    "pinia": "^2.1.7",
+    "pinia": "^4.0.3",
     "pinia-plugin-persistedstate": "^3.2.1",
     "vue": "^3.4.29",
     "vue-router": "^4.3.3"
