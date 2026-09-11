@@ -94,12 +94,17 @@ const phaseLabels: Record<TaskPhase, string> = {
   queued: '等待 Worker 接收任务',
   preparing: '准备行程请求',
   collecting_context: '加载偏好和会话上下文',
+  draft_planning: '生成行程草案',
+  critiquing: '审查行程草案',
+  refining: '按审查建议修订',
   llm_planning: '生成每日行程',
   meal_enrichment: '补充餐饮信息',
   validating: '校验行程质量',
   saving: '保存行程和初始版本',
   completed: '行程规划完成',
-  failed: '行程生成失败'
+  failed: '行程生成失败',
+  cancelled: '任务已取消',
+  expired: '任务已过期'
 }
 
 const phaseLabel = computed(() => phaseLabels[taskPhase.value])
@@ -115,6 +120,9 @@ const phaseOrder: TaskPhase[] = [
   'queued',
   'preparing',
   'collecting_context',
+  'draft_planning',
+  'critiquing',
+  'refining',
   'llm_planning',
   'meal_enrichment',
   'validating',

@@ -1,21 +1,9 @@
 import asyncio
 from datetime import date, timedelta
 
-from app.agents.prompts import PLANNER_AGENT_PROMPT_LEGACY
 from app.agents.trip_planner import PlannerAgent, TripPlannerAgent, WeatherQueryAgent
 from app.models.schemas import TripPlanRequest, WeatherInfo
 from app.services.mock_data import build_mock_attractions, build_mock_hotels, build_mock_weather
-
-
-class RecordingLLMService:
-    def __init__(self):
-        self.system_prompt = None
-        self.user_prompt = None
-
-    def generate_json(self, system_prompt, user_prompt):
-        self.system_prompt = system_prompt
-        self.user_prompt = user_prompt
-        return None
 
 
 class FakeWeatherService:
@@ -200,7 +188,7 @@ def test_mock_plan_overall_suggestions_avoid_forbidden_templates():
     assert "北京烤鸭" in plan.overall_suggestions
 
 
-def test_planner_agent_uses_legacy_prompt_when_enhanced_prompt_disabled():
+def test_deterministic_planner_ignores_model_configuration():
     request = TripPlanRequest(
         city="北京",
         start_date="2026-06-01",
@@ -211,16 +199,14 @@ def test_planner_agent_uses_legacy_prompt_when_enhanced_prompt_disabled():
         transportation="公共交通",
         accommodation="经济型酒店",
     )
-    llm_service = RecordingLLMService()
-    planner = PlannerAgent(llm_service, use_llm=True, use_enhanced_prompt=False)
+    planner = PlannerAgent()
 
-    planner.run(
+    plan = planner.run(
         request=request,
         attractions=build_mock_attractions(request.city, request.preferences, request.days),
         weather_info=build_mock_weather(request.start_date, request.days),
         hotels=build_mock_hotels(request.city, request.accommodation, request.budget),
-        planner_query="query",
     )
 
-    assert llm_service.system_prompt == PLANNER_AGENT_PROMPT_LEGACY
-    assert llm_service.user_prompt == "query"
+    assert plan.city == request.city
+    assert len(plan.days) == request.days

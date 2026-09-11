@@ -30,11 +30,11 @@ def _request() -> TripPlanRequest:
     )
 
 
-def test_bootstrap_registers_llm_planner_when_tool_planning_enabled():
+def test_bootstrap_registers_openai_tools_planner_when_selected():
     registry = bootstrap_orchestration(
         llm_service=FakeLLMService(),
         enable_external_services=True,
-        enable_llm_tool_planning=True,
+        planner_backend="openai_tools",
         tool_registry=FakeToolRegistry(),
         tool_executor=FakeToolExecutor(),
     )
@@ -48,7 +48,7 @@ def test_bootstrap_passes_critique_settings_to_llm_planner():
     registry = bootstrap_orchestration(
         llm_service=FakeLLMService(),
         enable_external_services=True,
-        enable_llm_tool_planning=True,
+        planner_backend="openai_tools",
         enable_plan_critique=False,
         max_refinement_rounds=1,
         min_pass_score=8.5,
@@ -64,11 +64,11 @@ def test_bootstrap_passes_critique_settings_to_llm_planner():
     assert agent.min_pass_score == 8.5
 
 
-def test_bootstrap_registers_legacy_planner_when_tool_planning_disabled():
+def test_bootstrap_registers_deterministic_planner_when_selected():
     registry = bootstrap_orchestration(
         llm_service=FakeLLMService(),
         enable_external_services=True,
-        enable_llm_tool_planning=False,
+        planner_backend="deterministic",
         tool_registry=FakeToolRegistry(),
         tool_executor=FakeToolExecutor(),
     )
@@ -95,10 +95,10 @@ def test_build_planner_query_includes_diversity_and_dedup_instructions():
     assert "去重" in query
     assert "外滩" in query
     assert "可用工具" in query
-    assert "baidu_poi_search" in query
+    assert "baidu_poi_search" not in query
     assert "baidu_direction" in query
-    assert "口味" in query
-    assert "人均" in query
+    assert "百度地图 HTTP API" in query
+    assert "days[].meals 必须返回空数组" in query
 
 
 def test_bootstrap_passes_baidu_service_to_tool_bootstrap(monkeypatch):

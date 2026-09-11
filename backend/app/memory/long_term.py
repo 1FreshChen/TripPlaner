@@ -6,14 +6,27 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.memory.vector_store import VectorMemoryStore, build_vector_memory_store
 from app.models.db_models import SavedItem, UserPreference
 
 
-class LongTermMemory:
-    """Cross-session user preferences and saved item memory."""
+_AUTO_VECTOR_STORE = object()
 
-    def __init__(self, db_session_factory=None):
+
+class LongTermMemory:
+    """Cross-session structured and semantic user memory."""
+
+    def __init__(
+        self,
+        db_session_factory=None,
+        vector_store: VectorMemoryStore | None | object = _AUTO_VECTOR_STORE,
+    ):
         self._db_factory = db_session_factory
+        self._vector_store: Any = (
+            build_vector_memory_store()
+            if vector_store is _AUTO_VECTOR_STORE
+            else vector_store
+        )
 
     async def get_preferences(self, user_id: uuid.UUID, db: AsyncSession) -> UserPreference:
         result = await db.execute(select(UserPreference).where(UserPreference.user_id == user_id))
@@ -33,6 +46,7 @@ class LongTermMemory:
         budget_level: str,
         days: int,
         liked_attractions: Optional[list[str]] = None,
+        source_id: uuid.UUID | None = None,
     ) -> None:
         prefs = await self.get_preferences(user_id, db)
 
@@ -62,6 +76,16 @@ class LongTermMemory:
         prefs.favorite_cities = cities[:10]
 
         await db.flush()
+        if self._vector_store is not None:
+            await self._vector_store.remember_trip(
+                user_id=user_id,
+                db=db,
+                city=city,
+                preferences=preferences,
+                budget_level=budget_level,
+                days=days,
+                source_id=source_id,
+            )
 
     async def get_saved_items(
         self,
@@ -94,4 +118,37 @@ class LongTermMemory:
         )
         db.add(item)
         await db.flush()
+        if self._vector_store is not None:
+            await self._vector_store.remember_saved_item(
+                user_id=user_id,
+                db=db,
+                item_id=item.id,
+                item_type=item_type,
+                item_data=item_data,
+                tags=tags or [],
+                note=note,
+            )
         return item
+
+    async def recall_semantic(
+        self,
+        user_id: uuid.UUID,
+        db: AsyncSession,
+        query: str,
+    ) -> list[dict[str, Any]]:
+        if self._vector_store is None:
+            return []
+        return await self._vector_store.search(user_id=user_id, db=db, query=query)
+
+    async def forget_saved_item(
+        self,
+        user_id: uuid.UUID,
+        item_id: uuid.UUID,
+        db: AsyncSession,
+    ) -> None:
+        if self._vector_store is not None:
+            await self._vector_store.forget_source(
+                user_id=user_id,
+                db=db,
+                source_key=f"saved_item:{item_id}",
+            )

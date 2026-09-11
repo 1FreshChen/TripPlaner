@@ -314,6 +314,82 @@ def test_llm_service_chat_with_tools_executes_tool_calls_and_returns_final_respo
     assert json.loads(second_messages[-1]["content"]) == {"success": True, "weather": "sunny"}
 
 
+def test_llm_service_turns_malformed_tool_arguments_into_tool_error(monkeypatch):
+    class FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._body
+
+    class FakeAsyncClient:
+        requests = []
+
+        def __init__(self, *args, **kwargs):
+            self._responses = [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_bad",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "amap_weather",
+                                            "arguments": "{bad json",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {},
+                },
+                {
+                    "choices": [{"message": {"content": "已忽略无效工具调用。"}}],
+                    "usage": {},
+                },
+            ]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, **kwargs):
+            self.__class__.requests.append(kwargs["json"])
+            return FakeResponse(self._responses.pop(0))
+
+    class RejectingExecutor:
+        async def execute_by_name(self, tool_name, **kwargs):
+            raise AssertionError("malformed arguments must not execute a tool")
+
+    FakeAsyncClient.requests = []
+    monkeypatch.setattr("app.services.llm_service.httpx.AsyncClient", FakeAsyncClient)
+    service = LLMService("test-key", "https://api.openai.com/v1", "gpt-test")
+
+    content, tool_calls, _ = asyncio.run(
+        service.chat_with_tools(
+            "system",
+            "user",
+            [{"type": "function", "function": {"name": "amap_weather", "parameters": {"type": "object"}}}],
+            RejectingExecutor(),
+        )
+    )
+
+    assert content == "已忽略无效工具调用。"
+    assert tool_calls[0]["id"] == "call_bad"
+    assert "Malformed tool arguments" in tool_calls[0]["error"]
+    tool_message = FakeAsyncClient.requests[1]["messages"][-1]
+    assert json.loads(tool_message["content"])["success"] is False
+
+
 def test_llm_service_chat_with_tools_respects_max_tool_rounds(monkeypatch):
     class FakeResponse:
         def raise_for_status(self):

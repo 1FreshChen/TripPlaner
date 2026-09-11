@@ -7,7 +7,9 @@ import pytest
 from hello_agents.tools import MCPTool
 
 from app.agents.trip_planner import TripPlannerAgent
+from app.config import get_settings
 from app.services import amap_mcp_service
+from app.services.amap_service import AmapService
 from app.services.amap_mcp_service import AmapMCPService, _PersistentMCPConnection
 from app.tools.bootstrap import bootstrap_tools
 
@@ -119,7 +121,7 @@ def test_amap_mcp_service_reuses_connection_and_normalizes_results():
     weather = service.get_weather("TestCity")
 
     assert connection.start_calls == 1
-    assert pois == [
+    assert pois.data == [
         {
             "id": "poi-1",
             "name": "Test Museum",
@@ -128,6 +130,7 @@ def test_amap_mcp_service_reuses_connection_and_normalizes_results():
             "biz_ext": {"rating": "4.8"},
             "location": "116.397128,39.916527",
             "type": "museum",
+            "_source": "amap_mcp",
         }
     ]
     assert [call[0] for call in connection.calls] == [
@@ -135,9 +138,9 @@ def test_amap_mcp_service_reuses_connection_and_normalizes_results():
         "maps_search_detail",
         "maps_weather",
     ]
-    assert weather[0].date == "2026-07-15"
-    assert weather[0].day_temp == 30
-    assert weather[0].wind_direction == "east"
+    assert weather.data[0].date == "2026-07-15"
+    assert weather.data[0].day_temp == 30
+    assert weather.data[0].wind_direction == "east"
 
 
 def test_shared_mcp_tool_does_not_write_to_stdout(capsys):
@@ -229,6 +232,44 @@ def test_persistent_connection_cancels_startup_after_timeout():
     assert not connection._thread.is_alive()
 
 
+def test_persistent_connection_rebuilds_client_after_tool_timeout():
+    class Client:
+        def __init__(self, *, hangs=False):
+            self.hangs = hangs
+            self.exit_calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.exit_calls += 1
+            return False
+
+        async def list_tools(self):
+            return [{"name": "maps_weather", "description": "", "input_schema": {}}]
+
+        async def call_tool(self, tool_name, arguments):
+            if self.hangs:
+                await asyncio.Event().wait()
+            return arguments
+
+    clients = [Client(hangs=True), Client()]
+    connection = _PersistentMCPConnection(
+        server_command=["fake-server"],
+        env={},
+        startup_timeout=1,
+        call_timeout=0.05,
+        client_factory=lambda: clients.pop(0),
+    )
+
+    try:
+        with pytest.raises(TimeoutError):
+            connection.call_tool("maps_weather", {"city": "A"})
+        assert connection.call_tool("maps_weather", {"city": "B"}) == {"city": "B"}
+    finally:
+        connection.close()
+
+
 def test_get_amap_mcp_service_is_process_singleton(monkeypatch):
     settings = SimpleNamespace(
         amap_api_key="",
@@ -258,5 +299,154 @@ def test_mcp_failure_returns_empty_when_http_fallback_is_disabled():
 
     service = build_service(FailedConnection())
 
-    assert service.search_pois("museum", "TestCity") == []
-    assert service.get_weather("TestCity") == []
+    assert service.search_pois("museum", "TestCity").is_error
+    assert service.get_weather("TestCity").is_error
+
+
+def test_mcp_qps_error_is_retried_once_then_succeeds(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "1")
+    get_settings.cache_clear()
+
+    class FlakyConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            if tool_name == "maps_text_search" and len(self.calls) == 0:
+                self.calls.append((tool_name, arguments))
+                raise RuntimeError("Get poi detail failed: CUQPS_HAS_EXCEEDED_THE_LIMIT")
+            return super().call_tool(tool_name, arguments)
+
+    service = build_service(FlakyConnection())
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert len([call for call in service._connection.calls if call[0] == "maps_text_search"]) == 2
+
+
+def test_mcp_qps_error_exhausts_retries_then_reports_error(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "1")
+    get_settings.cache_clear()
+
+    class QpsConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            self.calls.append((tool_name, arguments))
+            raise RuntimeError("Get poi detail failed: CUQPS_HAS_EXCEEDED_THE_LIMIT")
+
+    service = build_service(QpsConnection())
+
+    result = service.search_pois("museum", "TestCity")
+
+    assert result.is_error
+    assert len(service._connection.calls) == 2
+
+
+def test_mcp_detail_failure_does_not_break_search(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "0")
+    get_settings.cache_clear()
+
+    class DetailFailingConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            self.calls.append((tool_name, arguments))
+            if tool_name == "maps_text_search":
+                return json.dumps(
+                    {
+                        "pois": [
+                            {"id": "poi-1", "name": "No Location A"},
+                            {"id": "poi-2", "name": "No Location B"},
+                        ]
+                    }
+                )
+            if tool_name == "maps_search_detail":
+                raise RuntimeError("Get poi detail failed: CUQPS_HAS_EXCEEDED_THE_LIMIT")
+            return super().call_tool(tool_name, arguments)
+
+    service = build_service(DetailFailingConnection())
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert [poi["name"] for poi in result.data] == ["No Location A", "No Location B"]
+    assert all("location" not in poi for poi in result.data)
+
+
+def test_mcp_enrichment_is_capped_by_config(monkeypatch):
+    monkeypatch.setenv("AMAP_QPS_RETRY_ATTEMPTS", "0")
+    monkeypatch.setenv("AMAP_ENRICH_DETAIL_LIMIT", "2")
+    get_settings.cache_clear()
+
+    class CountingConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            self.calls.append((tool_name, arguments))
+            if tool_name == "maps_text_search":
+                return json.dumps(
+                    {
+                        "pois": [
+                            {"id": f"poi-{index}", "name": f"Museum {index}"}
+                            for index in range(1, 5)
+                        ]
+                    }
+                )
+            if tool_name == "maps_search_detail":
+                return json.dumps(
+                    {
+                        "pois": [
+                            {
+                                "id": arguments["id"],
+                                "location": {"lng": 116.397128, "lat": 39.916527},
+                                "type": "museum",
+                            }
+                        ]
+                    }
+                )
+            return super().call_tool(tool_name, arguments)
+
+    service = build_service(CountingConnection())
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert len(result.data) == 2
+    detail_calls = [call for call in service._connection.calls if call[0] == "maps_search_detail"]
+    assert len(detail_calls) == 2
+
+
+def test_zero_detail_limit_disables_detail_calls(monkeypatch):
+    monkeypatch.setenv("AMAP_ENRICH_DETAIL_LIMIT", "0")
+    get_settings.cache_clear()
+    connection = FakeConnection()
+    service = build_service(connection)
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert all(call[0] != "maps_search_detail" for call in connection.calls)
+
+
+def test_mcp_detail_failure_uses_http_detail_fallback(monkeypatch):
+    class DetailFailingConnection(FakeConnection):
+        def call_tool(self, tool_name, arguments):
+            if tool_name == "maps_search_detail":
+                raise TimeoutError("detail timeout")
+            return super().call_tool(tool_name, arguments)
+
+    service = AmapMCPService(
+        api_key="test-key",
+        server_command=["fake-server"],
+        http_fallback=True,
+        connection=DetailFailingConnection(),
+    )
+    monkeypatch.setattr(
+        AmapService,
+        "get_poi_detail",
+        lambda self, poi_id: {
+            "id": poi_id,
+            "location": "116.397128,39.916527",
+            "photos": [{"url": "https://example.test/museum.jpg"}],
+            "_source": "amap_http",
+        },
+    )
+
+    result = service.search_pois("museum", "TestCity", offset=5)
+
+    assert not result.is_error
+    assert result.data[0]["location"] == "116.397128,39.916527"
+    assert result.data[0]["_source"] == "amap_http"

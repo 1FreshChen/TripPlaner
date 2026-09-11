@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,7 +9,13 @@ from app.api.deps import get_trip_task_reader
 from app.api.main import app
 from app.models.db_models import TripPlanTask
 from app.models.schemas import TripPlanTaskStatusResponse
-from app.services.task_service import TripPlanTaskService, transition_task
+from app.services.task_service import (
+    TripPlanTaskService,
+    cleanup_expired_tasks,
+    recover_stale_queued_tasks,
+    transition_task,
+)
+from app.tasks import worker
 
 
 def _task(now: datetime) -> TripPlanTask:
@@ -70,8 +77,75 @@ def test_task_status_response_reports_elapsed_time_and_result_url():
     assert response.result_url == "/api/trip/tasks/tp_20260713_test/result"
 
 
+class FakeMaintenanceDB:
+    def __init__(self, tasks):
+        self.tasks = tasks
+        self.commit_calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def scalars(self, statement):
+        return SimpleNamespace(all=lambda: self.tasks)
+
+    async def commit(self):
+        self.commit_calls += 1
+
+
+class FakeMaintenanceFactory:
+    def __init__(self, db):
+        self.db = db
+
+    def __call__(self):
+        return self.db
+
+
+def test_task_maintenance_expires_and_recovers_stale_tasks():
+    now = datetime(2026, 7, 13, tzinfo=timezone.utc)
+    expired = _task(now - timedelta(days=2))
+    expired.expires_at = now - timedelta(seconds=1)
+    expired_db = FakeMaintenanceDB([expired])
+
+    stale = _task(now - timedelta(minutes=10))
+    stale.expires_at = now + timedelta(days=1)
+    stale_db = FakeMaintenanceDB([stale])
+
+    assert asyncio.run(cleanup_expired_tasks(FakeMaintenanceFactory(expired_db), now=now)) == 1
+    assert expired.status == "expired"
+    assert expired.error_code == "TASK_EXPIRED"
+    assert expired.finished_at == now
+
+    assert asyncio.run(
+        recover_stale_queued_tasks(
+            FakeMaintenanceFactory(stale_db),
+            stale_threshold_seconds=120,
+            now=now,
+        )
+    ) == 1
+    assert stale.status == "failed"
+    assert stale.error_code == "ENQUEUE_LOST"
+    assert stale.finished_at == now
+
+def test_worker_always_delegates_to_langgraph_runtime(monkeypatch):
+    calls = []
+
+    async def fake_run(ctx, task_id):
+        calls.append((ctx, task_id))
+        return "plan-id"
+
+    monkeypatch.setattr(worker, "_run_langgraph_task", fake_run)
+
+    result = asyncio.run(worker.generate_trip_plan_task({"runtime": True}, "task-id"))
+
+    assert result == "plan-id"
+    assert calls == [({"runtime": True}, "task-id")]
+
+
 class CompletedTaskService:
-    async def get_status(self, task_id: str):
+    async def get_status(self, task_id: str, session_id: str | None = None):
         return TripPlanTaskStatusResponse(
             task_id=task_id,
             status="succeeded",
@@ -89,7 +163,7 @@ class CompletedTaskService:
 
 
 class RunningTaskService:
-    async def get_status(self, task_id: str):
+    async def get_status(self, task_id: str, session_id: str | None = None):
         return TripPlanTaskStatusResponse(
             task_id=task_id,
             status="running",
@@ -107,7 +181,10 @@ class RunningTaskService:
 def test_sse_emits_completed_event_from_persisted_status():
     app.dependency_overrides[get_trip_task_reader] = lambda: CompletedTaskService()
     with TestClient(app) as client:
-        response = client.get("/api/trip/tasks/tp_20260713_test/events")
+        response = client.get(
+            "/api/trip/tasks/tp_20260713_test/events",
+            headers={"X-Session-ID": "11111111-1111-1111-1111-111111111111"},
+        )
 
     assert response.status_code == 200
     assert "event: completed" in response.text
@@ -122,7 +199,10 @@ def test_sse_closes_stalled_connection_after_configured_timeout():
         return_value=SimpleNamespace(task_sse_timeout_seconds=0),
     ):
         with TestClient(app) as client:
-            response = client.get("/api/trip/tasks/tp_20260713_stalled/events")
+            response = client.get(
+                "/api/trip/tasks/tp_20260713_stalled/events",
+                headers={"X-Session-ID": "11111111-1111-1111-1111-111111111111"},
+            )
 
     assert response.status_code == 200
     assert "event: timeout" in response.text

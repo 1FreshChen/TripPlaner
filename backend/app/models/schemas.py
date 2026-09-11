@@ -33,6 +33,10 @@ class Attraction(BaseModel):
     category: Optional[str] = Field(default="景点", description="景点类别")
     rating: Optional[float] = Field(default=None, ge=0, le=5, description="评分")
     image_url: Optional[str] = Field(default=None, description="图片URL")
+    poi_id: Optional[str] = Field(default=None, description="地图服务POI唯一标识")
+    data_source: Optional[str] = Field(default=None, description="景点与坐标数据来源")
+    image_source: Optional[str] = Field(default=None, description="图片来源")
+    coordinate_verified: bool = Field(default=False, description="坐标是否经地图POI核验")
     ticket_price: int = Field(default=0, ge=0, description="门票价格(元)")
 
 
@@ -50,6 +54,8 @@ class Meal(BaseModel):
     price_per_person: Optional[int] = Field(default=None, ge=0, description="人均消费(元)")
     shop_hours: Optional[str] = Field(default=None, description="营业时间")
     comment_num: Optional[int] = Field(default=None, ge=0, description="评论数量")
+    data_source: Optional[str] = Field(default=None, description="餐厅明细数据来源")
+    poi_id: Optional[str] = Field(default=None, description="地图服务餐厅POI唯一标识")
 
 
 class Hotel(BaseModel):
@@ -218,12 +224,17 @@ TaskPhase = Literal[
     "queued",
     "preparing",
     "collecting_context",
+    "draft_planning",
+    "critiquing",
+    "refining",
     "llm_planning",
     "validating",
     "meal_enrichment",
     "saving",
     "completed",
     "failed",
+    "cancelled",
+    "expired",
 ]
 
 
@@ -262,6 +273,7 @@ class TripPlanUpdateRequest(BaseModel):
     """旅行计划编辑请求"""
 
     plan_json: TripPlan = Field(..., description="修改后的完整旅行计划")
+    expected_version: int = Field(..., ge=1, description="客户端当前持有的版本号，用于冲突检测")
     change_summary: str = Field(default="手动编辑", description="修改摘要")
 
     @field_validator("change_summary", mode="before")

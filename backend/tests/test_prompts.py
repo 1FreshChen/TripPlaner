@@ -1,4 +1,4 @@
-from app.agents.prompts import PLANNER_AGENT_PROMPT, PLANNER_AGENT_PROMPT_LEGACY
+from app.agents.prompts import PLANNER_AGENT_PROMPT
 
 
 def test_enhanced_planner_prompt_contains_phase1_quality_rules():
@@ -18,8 +18,3 @@ def test_enhanced_planner_prompt_contains_phase1_quality_rules():
 
     for fragment in required_fragments:
         assert fragment in PLANNER_AGENT_PROMPT
-
-
-def test_legacy_planner_prompt_keeps_original_basic_requirements():
-    assert "你是行程规划专家" in PLANNER_AGENT_PROMPT_LEGACY
-    assert "每天安排2-3个景点" in PLANNER_AGENT_PROMPT_LEGACY

@@ -123,3 +123,19 @@ def test_plan_critic_returns_neutral_pass_when_llm_returns_no_result():
     assert result.average_score == 7.0
     assert result.needs_revision is False
     assert "未返回结果" in result.revision_summary
+
+
+def test_plan_critic_passes_none_to_disable_inner_timeout():
+    class AsyncLLMService(FakeLLMService):
+        async def generate_json_async(self, system_prompt, user_prompt, *, timeout_seconds):
+            self.calls.append({"timeout_seconds": timeout_seconds})
+            return _critique_response()
+
+    request = _request()
+    plan = TripPlan.model_validate(_plan_payload(request))
+    llm = AsyncLLMService(None)
+
+    result = asyncio.run(PlanCritic(llm).evaluate(plan, request, timeout_seconds=None))
+
+    assert result.average_score == 8.0
+    assert llm.calls[0]["timeout_seconds"] is None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -79,6 +80,48 @@ class LLMService:
             logger.warning("LLM JSON generation failed, fallback will be used: %s", exc)
             return None
 
+    async def generate_json_async(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        timeout_seconds: float | None = 60.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Cancelable JSON generation for bounded orchestration stages."""
+        if not self.enabled:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.4,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                return json.loads(content)
+        except asyncio.CancelledError:
+            raise
+        except httpx.TimeoutException as exc:
+            timeout_label = f"{timeout_seconds:.1f}s" if timeout_seconds is not None else "provider timeout"
+            raise TimeoutError(
+                f"LLM JSON request timed out after {timeout_label}"
+            ) from exc
+        except Exception as exc:
+            logger.warning("Async LLM JSON generation failed: %s", exc)
+            return None
+
     async def chat_with_tools(
         self,
         system_prompt: str,
@@ -137,16 +180,32 @@ class LLMService:
                     }
                 )
                 parsed_calls: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
+                parse_errors: Dict[str, str] = {}
                 for tool_call in tool_calls:
                     tool_name = tool_call.get("function", {}).get("name", "")
-                    arguments = json.loads(tool_call.get("function", {}).get("arguments") or "{}")
-                    tool_calls_log.append(
-                        {
-                            "tool": tool_name,
-                            "arguments": arguments,
-                            "id": tool_call.get("id"),
-                        }
-                    )
+                    tool_call_id = str(tool_call.get("id") or "")
+                    raw_arguments = tool_call.get("function", {}).get("arguments") or "{}"
+                    try:
+                        arguments = json.loads(raw_arguments)
+                        if not isinstance(arguments, dict):
+                            raise TypeError("tool arguments must decode to a JSON object")
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        parse_error = f"Malformed tool arguments: {exc}"
+                        logger.warning(
+                            "LLM returned malformed tool arguments for '%s': %s",
+                            tool_name,
+                            str(raw_arguments)[:200],
+                        )
+                        arguments = {}
+                        parse_errors[tool_call_id] = parse_error
+                    log_entry = {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "id": tool_call.get("id"),
+                    }
+                    if tool_call_id in parse_errors:
+                        log_entry["error"] = parse_errors[tool_call_id]
+                    tool_calls_log.append(log_entry)
                     parsed_calls.append((tool_call, tool_name, arguments))
 
                 if tool_rounds >= max_tool_rounds:
@@ -163,11 +222,15 @@ class LLMService:
                     )
 
                 for tool_call, tool_name, arguments in parsed_calls:
-                    try:
-                        result = await tool_executor.execute_by_name(tool_name, **arguments)
-                    except Exception as exc:
-                        logger.warning("Tool execution failed for '%s': %s", tool_name, exc)
-                        result = {"success": False, "tool": tool_name, "error": str(exc)}
+                    parse_error = parse_errors.get(str(tool_call.get("id") or ""))
+                    if parse_error:
+                        result = {"success": False, "tool": tool_name, "error": parse_error}
+                    else:
+                        try:
+                            result = await tool_executor.execute_by_name(tool_name, **arguments)
+                        except Exception as exc:
+                            logger.warning("Tool execution failed for '%s': %s", tool_name, exc)
+                            result = {"success": False, "tool": tool_name, "error": str(exc)}
                     messages.append(
                         {
                             "role": "tool",

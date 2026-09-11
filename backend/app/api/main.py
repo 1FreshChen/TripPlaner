@@ -1,4 +1,6 @@
 import asyncio
+import logging
+from contextlib import suppress
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -24,23 +26,55 @@ from app.api.routes.saved_items import router as saved_items_router
 from app.api.routes.sessions import router as sessions_router
 from app.api.routes.trip import router as trip_router
 from app.config import get_settings
+from app.database import get_session_factory
 from app.services.amap_mcp_service import close_amap_mcp_service
+from app.services.task_service import (
+    cleanup_expired_tasks,
+    recover_stale_queued_tasks,
+)
 from app.tasks.queue import close_task_queue
 
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
+
+
+async def _maintain_tasks() -> None:
+    while True:
+        await asyncio.sleep(settings.task_maintenance_interval_seconds)
+        try:
+            session_factory = get_session_factory()
+            expired = await cleanup_expired_tasks(session_factory)
+            recovered = await recover_stale_queued_tasks(
+                session_factory,
+                stale_threshold_seconds=settings.task_stale_queued_seconds,
+            )
+            if expired or recovered:
+                logger.warning(
+                    "Task maintenance updated stale records: expired=%d enqueue_lost=%d",
+                    expired,
+                    recovered,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Task maintenance failed")
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    maintenance_task = asyncio.create_task(_maintain_tasks(), name="trip-task-maintenance")
     try:
         yield
     finally:
+        maintenance_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await maintenance_task
         await close_task_queue(getattr(application.state, "task_queue", None))
         await asyncio.to_thread(close_amap_mcp_service)
 
 
-app = FastAPI(title="智能旅行助手 API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="智能旅行助手 API", version="0.4.0", lifespan=lifespan)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)

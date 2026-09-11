@@ -8,7 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.models.db_models import AuditEvent, TripPlanVersion
-from app.models.schemas import ConversationRequest, DayPlan, TripPlan, TripPlanRequest
+from app.models.schemas import ConversationRequest, DayPlan, TripPlan, TripPlanRequest, TripPlanUpdateRequest
 from app.services.mock_data import build_mock_attractions, build_mock_hotels, build_mock_weather
 from app.services import state_service
 from app.services.llm_service import TokenUsage as LLMTokenUsage
@@ -582,7 +582,36 @@ def test_modify_plan_via_conversation_raises_when_retry_fails():
 
     assert referenced_plan.version == 1
     assert not [item for item in fake_db.added if isinstance(item, TripPlanVersion)]
-    assert any(isinstance(item, AuditEvent) and item.event_type == "trip_plan_conversation_update_failed" for item in fake_db.added)
+
+
+def test_modify_plan_via_conversation_does_not_mutate_plan_when_dates_are_invalid():
+    original = _conversation_trip_plan()
+    invalid = original.model_copy(
+        update={
+            "city": "上海",
+            "start_date": "not-a-date",
+        }
+    )
+    referenced_plan = _fake_plan_model(original)
+    service = StateService(FakeConversationDB())
+    llm = FakeModificationLLM([invalid.model_dump_json(), invalid.model_dump_json()])
+
+    with pytest.raises(PlanModificationError, match="日期解析失败"):
+        asyncio.run(
+            service._modify_plan_via_conversation(
+                llm=llm,
+                tool_executor=SimpleNamespace(),
+                referenced_plan=referenced_plan,
+                user_message="把目的地改成上海",
+                session_uuid=referenced_plan.session_id,
+                conversation_id=uuid.uuid4(),
+            )
+        )
+
+    assert referenced_plan.version == 1
+    assert referenced_plan.city == original.city
+    assert referenced_plan.start_date.isoformat() == original.start_date
+    assert referenced_plan.plan_json == original.model_dump()
 
 
 def test_send_conversation_message_notifies_when_plan_update_fails(monkeypatch):
@@ -668,4 +697,58 @@ def test_send_conversation_message_notifies_when_plan_update_fails(monkeypatch):
     assert result.plan_update_failed is True
     assert "没有成功保存修改" in result.content
     assert assistants[-1].metadata_json["plan_update_failed"] is True
+    assert any(
+        isinstance(item, AuditEvent) and item.event_type == "trip_plan_conversation_update_failed"
+        for item in fake_db.added
+    )
     assert len(FakeLLMService.calls) == 3
+
+
+def test_update_trip_plan_rejects_stale_expected_version(monkeypatch):
+    current_plan = _fake_plan_model(_conversation_trip_plan())
+    current_plan.version = 2
+    service = StateService(FakeConversationDB())
+
+    async def fake_get_plan(plan_id, session_id=None, *, for_update=False):
+        assert plan_id == str(current_plan.id)
+        assert session_id == str(current_plan.session_id)
+        assert for_update is True
+        return current_plan
+
+    monkeypatch.setattr(service, "_get_public_plan", fake_get_plan)
+    update = TripPlanUpdateRequest(
+        plan_json=_conversation_trip_plan("stale edit"),
+        expected_version=1,
+        change_summary="stale edit",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            service.update_trip_plan(
+                str(current_plan.id),
+                update,
+                session_id=str(current_plan.session_id),
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert current_plan.version == 2
+
+
+def test_get_plan_scopes_query_to_session_owner():
+    captured = {}
+
+    class FakeDB:
+        async def scalar(self, statement):
+            captured["statement"] = str(statement)
+            return None
+
+    service = StateService(FakeDB())
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(service.get_trip_plan(str(uuid.uuid4()), session_id=str(uuid.uuid4())))
+
+    assert exc.value.status_code == 404
+    assert "trip_plans.session_id" in captured["statement"]
+    assert "trip_plans.status IN" in captured["statement"]
+    assert "archived" not in captured["statement"]

@@ -21,13 +21,29 @@ class PlanCritic:
     def __init__(self, llm_service: LLMService):
         self.llm_service = llm_service
 
-    async def evaluate(self, plan: TripPlan, request: TripPlanRequest) -> CritiqueResult:
+    async def evaluate(
+        self,
+        plan: TripPlan,
+        request: TripPlanRequest,
+        *,
+        strict: bool = False,
+        timeout_seconds: float | None = 60.0,
+    ) -> CritiqueResult:
         """对行程进行多维度评估。"""
         prompt = self._build_critique_prompt(plan, request)
-        generate_json = self.llm_service.generate_json
-        if inspect.iscoroutinefunction(generate_json):
-            result = await generate_json(system_prompt=CRITIC_AGENT_PROMPT, user_prompt=prompt)
+        generate_json_async = getattr(self.llm_service, "generate_json_async", None)
+        if callable(generate_json_async):
+            result = await generate_json_async(
+                system_prompt=CRITIC_AGENT_PROMPT,
+                user_prompt=prompt,
+                timeout_seconds=timeout_seconds,
+            )
         else:
+            result = None
+        generate_json = self.llm_service.generate_json
+        if generate_json_async is None and inspect.iscoroutinefunction(generate_json):
+            result = await generate_json(system_prompt=CRITIC_AGENT_PROMPT, user_prompt=prompt)
+        elif generate_json_async is None:
             result = await asyncio.to_thread(
                 generate_json,
                 system_prompt=CRITIC_AGENT_PROMPT,
@@ -36,11 +52,15 @@ class PlanCritic:
         if inspect.isawaitable(result):
             result = await result
         if result is None:
+            if strict:
+                raise RuntimeError("Plan critic did not return a result")
             logger.warning("Plan critic returned no result; keeping current plan")
             return self._pass_result("审视服务未返回结果，保留当前行程")
         try:
             return CritiqueResult.model_validate(result)
         except ValidationError as exc:
+            if strict:
+                raise RuntimeError("Plan critic returned an invalid result") from exc
             logger.warning("Plan critic returned invalid result; keeping current plan: %s", exc)
             return self._pass_result("审视结果格式无效，保留当前行程")
 

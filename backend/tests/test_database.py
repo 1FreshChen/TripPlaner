@@ -119,6 +119,7 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
         "conversation_messages",
         "user_preferences",
         "saved_items",
+        "memory_entries",
         "audit.event_log",
         "audit.token_usage",
     }.issubset(tables.keys())
@@ -129,7 +130,7 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
         for constraint in trip_plans.constraints
         if constraint.__class__.__name__ == "CheckConstraint"
     )
-    for status in ("draft", "generating", "completed", "editing", "archived"):
+    for status in ("draft", "generating", "completed", "editing", "archived", "failed"):
         assert status in status_constraints
     assert "idx_trip_plans_session_id" in {index.name for index in trip_plans.indexes}
 
@@ -143,6 +144,25 @@ def test_db_models_metadata_matches_phase1_tables_and_schemas():
     event_log = tables["audit.event_log"]
     assert event_log.schema == "audit"
     assert "idx_audit_event_type" in {index.name for index in event_log.indexes}
+
+    tasks = tables["trip_plan_tasks"]
+    for column in (
+        "heartbeat_at",
+        "lease_owner",
+        "workflow_version",
+        "state_schema_version",
+        "recovery_state",
+        "recovery_enqueued_at",
+        "checkpoint_deleted_at",
+    ):
+        assert column in tasks.columns
+    assert "idx_trip_plan_tasks_recovery" in {index.name for index in tasks.indexes}
+
+    memory_entries = tables["memory_entries"]
+    assert str(memory_entries.columns.embedding.type) == "VECTOR(1536)"
+    assert "idx_memory_entries_embedding_hnsw" in {
+        index.name for index in memory_entries.indexes
+    }
 
 
 def test_initial_alembic_migration_contains_required_schema_objects():
@@ -159,5 +179,23 @@ def test_initial_alembic_migration_contains_required_schema_objects():
         '"event_log"',
         "schema=\"audit\"",
         "idx_token_usage_model",
+    ):
+        assert expected in migration
+
+
+def test_pgvector_memory_migration_enables_extension_and_hnsw_index():
+    migration_path = "alembic/versions/005_pgvector_long_term_memory.py"
+
+    with open(migration_path, encoding="utf-8") as migration_file:
+        migration = migration_file.read()
+
+    for expected in (
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        '"memory_entries"',
+        "VECTOR(1536)",
+        "uq_memory_entries_user_source",
+        "idx_memory_entries_embedding_hnsw",
+        'postgresql_using="hnsw"',
+        'postgresql_ops={"embedding": "vector_cosine_ops"}',
     ):
         assert expected in migration

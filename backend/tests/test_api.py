@@ -75,6 +75,7 @@ def test_create_trip_plan_returns_accepted_task():
     app.dependency_overrides[get_task_queue] = lambda: queue
     response = client.post(
         "/api/trip/plan",
+        headers={"X-Session-ID": _payload()["session_id"]},
         json=_payload(),
     )
 
@@ -96,7 +97,11 @@ def test_create_trip_plan_returns_accepted_task():
 
 def test_original_synchronous_plan_flow_remains_available():
     app.dependency_overrides[get_state_service] = lambda: FakeStateService()
-    response = client.post("/api/trip/plan/sync", json=_payload())
+    response = client.post(
+        "/api/trip/plan/sync",
+        headers={"X-Session-ID": _payload()["session_id"]},
+        json=_payload(),
+    )
 
     assert response.status_code == 201
     assert response.json()["plan_id"] == "plan-1"

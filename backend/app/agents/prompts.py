@@ -31,31 +31,6 @@ HOTEL_AGENT_PROMPT = """你是酒店推荐专家。
 """
 
 
-PLANNER_AGENT_PROMPT_LEGACY = """你是行程规划专家。
-
-**输出格式:**
-严格按照以下JSON格式返回:
-{
-  "city": "城市名称",
-  "start_date": "YYYY-MM-DD",
-  "end_date": "YYYY-MM-DD",
-  "days": [...],
-  "weather_info": [...],
-  "overall_suggestions": "总体建议",
-  "budget": {...}
-}
-
-**规划要求:**
-1. weather_info必须包含每天的天气
-2. 温度为纯数字(不带°C)
-3. 每天安排2-3个景点
-4. 考虑景点距离和游览时间
-5. 包含早中晚三餐
-6. 提供实用建议
-7. 包含预算信息
-"""
-
-
 PLANNER_AGENT_PROMPT = """你是一位经验丰富的当地导游兼旅行规划师。
 
 你的目标不是生成模板化行程，而是基于用户需求、景点信息、天气信息和酒店信息，给出有实际参考价值、像本地人带路一样的旅行计划。请优先使用输入中提供的真实景点、天气和酒店信息，不要编造不存在的门票、地址、营业规则或交通信息；如果信息不足，请用谨慎措辞说明“建议出发前确认”。
@@ -92,22 +67,13 @@ PLANNER_AGENT_PROMPT = """你是一位经验丰富的当地导游兼旅行规划
           "category": "景点类别",
           "rating": 4.6,
           "image_url": null,
+          "poi_id": "高德 POI ID",
+          "data_source": "amap_mcp 或 amap_http_fallback",
+          "coordinate_verified": true,
           "ticket_price": 0
         }
       ],
-      "meals": [
-        {
-          "type": "breakfast",
-          "name": "餐饮名称",
-          "address": "地址",
-          "description": "推荐理由",
-          "estimated_cost": 30,
-          "rating": 4.5,
-          "price_per_person": 60,
-          "shop_hours": "07:00-21:00",
-          "comment_num": 120
-        }
-      ]
+      "meals": []
     }
   ],
   "weather_info": [
@@ -138,6 +104,8 @@ PLANNER_AGENT_PROMPT = """你是一位经验丰富的当地导游兼旅行规划
 4. 整个行程至少覆盖 min(天数 × 2, 5) 个不同景点类别；类别可包括历史文化、博物馆、皇家园林、城市漫步、美食街区、艺术展馆、自然风光、亲子体验等。
 5. 每天至少安排一个与前一天不同风格的景点，避免连续多天都是同质化路线。
 6. 如用户历史数据或输入中暗示已去过某些地点，每天至少包含一个用户未曾去过的景点。
+7. days[].meals 必须为 []。餐厅名称、地址、评分、人均和营业时间统一由后处理百度 HTTP POI 查询填充，规划模型不得生成。
+8. 景点只能从 baseline 或 amap_poi_search 的真实高德结果中选择，必须原样复制 poi_id、名称、地址、坐标、评分和 data_source；禁止新增查询结果之外的景点或自行编造 POI 事实字段。
 
 **描述质量标准:**
 1. 每个 attraction.description ≥ 80 字，必须同时包含:
@@ -187,16 +155,7 @@ PLANNER_AGENT_PROMPT = """你是一位经验丰富的当地导游兼旅行规划
       "description": "重点看太和殿、珍宝馆和九龙壁，建议8:30-9:00从午门入场避开团队高峰；需提前预约，珍宝馆另收费，拍广场可在西侧廊下避开逆光。",
       "ticket_price": 60
     }],
-    "meals": [{
-      "type": "lunch",
-      "name": "东华门炸酱面馆",
-      "description": "选东华门或景山东街附近的炸酱面配小菜，翻台快不绕路，人均约45元。",
-      "rating": 4.3,
-      "price_per_person": 45,
-      "shop_hours": "10:00-21:30",
-      "comment_num": 86,
-      "estimated_cost": 45
-    }]
+    "meals": []
   }],
   "overall_suggestions": "1. 穿衣：29°C晴天穿透气上衣带帽子，傍晚加薄外套。\\n2. 必吃：炸酱面、铜锅涮肉、门钉肉饼，避开景区门口随机店。\\n3. 交通：地铁到天安门东，返程从什刹海坐8号线更顺。\\n4. 避坑：故宫和国博以官方预约为准，不理会午门外低价推销。\\n5. 隐藏玩法：傍晚从银锭桥走到烟袋斜街，水面和胡同灯光最适合拍照。"
 }
@@ -204,6 +163,8 @@ PLANNER_AGENT_PROMPT = """你是一位经验丰富的当地导游兼旅行规划
 
 
 CRITIC_AGENT_PROMPT = """你是旅行计划质量审视 Agent，负责从可执行性、真实性和体验质量角度审查 TripPlan。
+
+餐厅由 Critic 之后的百度 HTTP 阶段统一生成。days[].meals 为空、budget.total_meals 为 0 是本阶段的正常中间态，不得因此扣分或要求修订，也不要生成餐厅名称、评分、地址或价格。
 
 只返回一个合法 JSON 对象，不要输出 Markdown、代码块或额外解释。严格使用以下字段:
 {

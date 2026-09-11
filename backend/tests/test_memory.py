@@ -124,8 +124,16 @@ def test_long_term_memory_incrementally_updates_user_preferences():
         async def flush(self):
             self.flush_count += 1
 
+    captured = {}
+
+    class FakeVectorStore:
+        async def remember_trip(self, **kwargs):
+            captured.update(kwargs)
+            return True
+
     fake_db = FakeDB()
-    memory = LongTermMemory()
+    memory = LongTermMemory(vector_store=FakeVectorStore())
+    source_id = uuid.uuid4()
 
     run(
         memory.update_from_trip(
@@ -135,6 +143,7 @@ def test_long_term_memory_incrementally_updates_user_preferences():
             preferences=["历史文化", "美食", " "],
             budget_level="中等",
             days=4,
+            source_id=source_id,
         )
     )
 
@@ -143,6 +152,55 @@ def test_long_term_memory_incrementally_updates_user_preferences():
     assert float(prefs.avg_trip_days) == 3.0
     assert prefs.favorite_cities == ["上海", "北京"]
     assert fake_db.flush_count == 1
+    assert captured["user_id"] == user_id
+    assert captured["source_id"] == source_id
+    assert captured["preferences"] == ["历史文化", "美食", " "]
+
+
+def test_long_term_memory_indexes_and_forgets_saved_items():
+    from app.memory.long_term import LongTermMemory
+
+    user_id = uuid.uuid4()
+    captured = {}
+
+    class FakeVectorStore:
+        async def remember_saved_item(self, **kwargs):
+            captured["remember"] = kwargs
+            return True
+
+        async def forget_source(self, **kwargs):
+            captured["forget"] = kwargs
+            return True
+
+    class FakeDB:
+        def __init__(self):
+            self.added = []
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def flush(self):
+            return None
+
+    db = FakeDB()
+    memory = LongTermMemory(vector_store=FakeVectorStore())
+
+    item = run(
+        memory.add_saved_item(
+            user_id=user_id,
+            db=db,
+            item_type="attraction",
+            item_data={"name": "故宫", "city": "北京"},
+            tags=["历史"],
+            note="下次早到",
+        )
+    )
+    run(memory.forget_saved_item(user_id=user_id, item_id=item.id, db=db))
+
+    assert db.added == [item]
+    assert captured["remember"]["item_id"] == item.id
+    assert captured["remember"]["item_data"]["name"] == "故宫"
+    assert captured["forget"]["source_key"] == f"saved_item:{item.id}"
 
 
 def test_memory_recall_returns_preferences_and_same_city_saved_attractions():
@@ -195,6 +253,7 @@ def test_memory_recall_returns_preferences_and_same_city_saved_attractions():
     assert recalled["travel_style"] == "慢节奏"
     assert recalled["avg_trip_days"] == 3.0
     assert recalled["saved_attractions_in_city"] == [{"name": "故宫", "city": "北京"}]
+    assert recalled["semantic_memories"] == []
 
 
 def test_planner_query_includes_recalled_memory_and_conversation_context():
@@ -220,6 +279,12 @@ def test_planner_query_includes_recalled_memory_and_conversation_context():
             "favorite_cities": ["北京"],
             "saved_attractions_in_city": [{"name": "故宫", "city": "北京"}],
             "avg_trip_days": 3.0,
+            "semantic_memories": [
+                {
+                    "content": "用户之前在西安偏好历史街区和慢节奏路线。",
+                    "similarity": 0.82,
+                }
+            ],
         },
         conversation_context=[
             {"role": "user", "content": "我想少走路"},
@@ -231,6 +296,8 @@ def test_planner_query_includes_recalled_memory_and_conversation_context():
     assert "历史文化" in query
     assert "中等: 3" in query
     assert "故宫" in query
+    assert "西安偏好历史街区" in query
+    assert "相关度 0.82" in query
     assert "user: 我想少走路" in query
 
 
@@ -320,6 +387,7 @@ def test_state_service_create_trip_plan_uses_memory_recall_and_updates_preferenc
     class FakeDB:
         def __init__(self):
             self.added = []
+            self.commits = 0
 
         def add(self, value):
             self.added.append(value)
@@ -328,7 +396,18 @@ def test_state_service_create_trip_plan_uses_memory_recall_and_updates_preferenc
             return None
 
         async def scalar(self, statement):
+            statement_text = str(statement)
+            if "FROM trip_plans" in statement_text:
+                return next(item for item in self.added if isinstance(item, state_service.TripPlanModel))
+            if "FROM trip_plan_versions" in statement_text:
+                return None
             return SimpleNamespace(id=user_id, session_token=str(session_id))
+
+        async def commit(self):
+            self.commits += 1
+
+        async def rollback(self):
+            return None
 
     monkeypatch.setattr(state_service, "LongTermMemory", FakeLongTermMemory, raising=False)
     monkeypatch.setattr(state_service, "MemoryRecall", FakeMemoryRecall, raising=False)
@@ -351,6 +430,7 @@ def test_state_service_create_trip_plan_uses_memory_recall_and_updates_preferenc
     assert captured["updated_trip"]["preferences"] == ["历史文化", "博物馆"]
     assert captured["updated_trip"]["budget_level"] == "中等"
     assert captured["updated_trip"]["days"] == 3
+    assert str(captured["updated_trip"]["source_id"]) == response.plan_id
     critique_events = [item for item in fake_db.added if getattr(item, "event_type", None) == "plan_critique"]
     assert len(critique_events) == 1
     assert critique_events[0].details_json["average_score"] == 8.0

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict
 
-from app.services.amap_service import AmapService
+from app.services.amap_service import AmapService, ServiceResult
 from app.tools.base import BaseTool
 
 
@@ -34,5 +34,14 @@ class AmapPOISearchTool(BaseTool):
 
     async def execute(self, keywords: str, city: str, offset: int = 10, **kwargs: Any) -> Dict[str, Any]:
         normalized_offset = max(1, min(offset, 25))
-        pois = await asyncio.to_thread(self._amap.search_pois, keywords, city, normalized_offset)
-        return {"pois": pois, "count": len(pois), "city": city, "success": True}
+        raw_result = await asyncio.to_thread(self._amap.search_pois, keywords, city, normalized_offset)
+        result = raw_result if isinstance(raw_result, ServiceResult) else ServiceResult(data=raw_result, source="legacy")
+        return {
+            "pois": result.data,
+            "count": len(result.data),
+            "city": city,
+            "success": not result.is_error,
+            "source": result.source,
+            "fallback_from": result.fallback_from,
+            "error": result.error,
+        }

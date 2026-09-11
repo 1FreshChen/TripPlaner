@@ -43,7 +43,7 @@ export const useTripPlanStore = defineStore('tripPlan', () => {
   const taskElapsedMs = ref(0)
   const taskPhaseElapsedMs = ref(0)
   const taskPhaseTimings = ref<Record<string, number>>({})
-  let taskEventSource: EventSource | null = null
+  let taskEventSource: ReturnType<typeof createTripPlanTaskEventSource> | null = null
   let pollingTimer: number | null = null
   let monitoringGeneration = 0
 
@@ -227,7 +227,16 @@ export const useTripPlanStore = defineStore('tripPlan', () => {
     }
 
     void refresh()
-    const eventSource = createTripPlanTaskEventSource(activeTaskId)
+    let eventSource: ReturnType<typeof createTripPlanTaskEventSource>
+    try {
+      eventSource = createTripPlanTaskEventSource(activeTaskId)
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : '无法建立任务进度连接'
+      startPolling()
+      return () => {
+        if (isCurrentMonitor()) stopTaskMonitoring()
+      }
+    }
     taskEventSource = eventSource
     const handleEvent = (event: MessageEvent<string>) => {
       if (!isCurrentMonitor()) return
@@ -275,7 +284,11 @@ export const useTripPlanStore = defineStore('tripPlan', () => {
   async function saveEdit(changeSummary = '手动编辑') {
     if (!currentPlan.value || !planId.value) return
     const planJson: TripPlan = currentPlan.value
-    const result = await updateTripPlan(planId.value, { plan_json: planJson, change_summary: changeSummary })
+    const result = await updateTripPlan(planId.value, {
+      plan_json: planJson,
+      expected_version: currentPlan.value.version,
+      change_summary: changeSummary
+    })
     applyPlan(result)
     await loadVersions()
   }
