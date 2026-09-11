@@ -73,7 +73,7 @@ jobs:
 
       - name: Build and publish backend
         id: backend
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: backend
           file: backend/Dockerfile.production
@@ -96,7 +96,7 @@ jobs:
 
       - name: Build and publish frontend
         id: frontend
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: frontend
           file: frontend/Dockerfile.production
