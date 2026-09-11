@@ -42,7 +42,7 @@ jobs:
       source_sha: ${{ steps.images.outputs.source_sha }}
     steps:
       - name: Check out verified source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.git_ref }}
 
@@ -147,7 +147,7 @@ jobs:
       RELEASE_SHA: ${{ needs.publish.outputs.source_sha }}
     steps:
       - name: Check out deployed configuration
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.publish.outputs.source_sha }}
 
